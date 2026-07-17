@@ -1,0 +1,169 @@
+name: interview-improvement-rag
+
+x-backend-env: &backend-env
+  APP_ENV: ${APP_ENV:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_JSON: ${LOG_JSON:-true}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-interview_user}:${POSTGRES_PASSWORD:-interview_password}@postgres:5432/${POSTGRES_DB:-interview_improvement_rag}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
+  QDRANT_URL: http://qdrant:6333
+  QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+  QDRANT_PREFER_GRPC: ${QDRANT_PREFER_GRPC:-false}
+  QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME:-interview_improvement_chunks}
+  QDRANT_DIM: ${QDRANT_DIM:-1024}
+  HOST: 0.0.0.0
+  PORT: 8001
+  SECRET_KEY: ${SECRET_KEY:-change-me-development-secret-key-32chars}
+  REFRESH_SECRET_KEY: ${REFRESH_SECRET_KEY:-change-me-development-refresh-key-32chars}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8001,http://127.0.0.1:8001}
+  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+  DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+  DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+  OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
+  AGENT_PLANNER_MODEL_CHAIN: ${AGENT_PLANNER_MODEL_CHAIN:-deepseek,openai,anthropic}
+  AGENT_ARCHITECT_MODEL_CHAIN: ${AGENT_ARCHITECT_MODEL_CHAIN:-deepseek,openai,anthropic}
+  AGENT_JUDGE_MODEL_CHAIN: ${AGENT_JUDGE_MODEL_CHAIN:-deepseek,openai,anthropic}
+  AGENT_SANDBOX_URL: ${AGENT_SANDBOX_URL:-}
+  AGENT_SANDBOX_TOKEN: ${AGENT_SANDBOX_TOKEN:-}
+  LANGGRAPH_CHECKPOINT_SETUP: ${LANGGRAPH_CHECKPOINT_SETUP:-false}
+  MODEL_ROOT: /app/models
+  UPLOAD_DIR: /app/uploads
+
+services:
+  migrate:
+    build:
+      context: .
+    image: interview-improvement-rag-backend:dev
+    command: uv run --frozen --no-dev alembic upgrade head
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+    image: interview-improvement-rag-backend:dev
+    container_name: interview-improvement-rag-backend
+    environment:
+      <<: *backend-env
+    ports:
+      - "8001:8001"
+    volumes:
+      - uploads_data:/app/uploads
+      - ${MODEL_ROOT:-~/models}:/app/models:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  worker:
+    image: interview-improvement-rag-backend:dev
+    command: uv run --frozen --no-dev celery -A app.core.celery:celery_app worker --loglevel=INFO --queues=document_index,agent_runtime --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
+    environment:
+      <<: *backend-env
+    volumes:
+      - uploads_data:/app/uploads
+      - ${MODEL_ROOT:-~/models}:/app/models:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  beat:
+    image: interview-improvement-rag-backend:dev
+    command: uv run --frozen --no-dev celery -A app.core.celery:celery_app beat --loglevel=INFO
+    environment:
+      <<: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    image: interview-improvement-rag-frontend:dev
+    container_name: interview-improvement-rag-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: interview-improvement-rag-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-interview_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-interview_password}
+      POSTGRES_DB: ${POSTGRES_DB:-interview_improvement_rag}
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: interview-improvement-rag-redis
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory 256mb --maxmemory-policy noeviction
+    ports:
+      - "16379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.1
+    container_name: interview-improvement-rag-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  uploads_data:

@@ -1,0 +1,53 @@
+[project]
+name = "interview-improvement-rag"
+version = "1.0.0"
+description = "Interview improvement learning platform backed by RAG and agent workflows"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "fastapi>=0.100.0",
+  "uvicorn>=0.23.0",
+  "sqlalchemy>=2.0.0",
+  "alembic>=1.13.0",
+  "psycopg2-binary>=2.9.0",
+  "psycopg[binary,pool]>=3.2.0",
+  "PyJWT>=2.8.0",
+  "openai>=1.0.0",
+  "numpy>=1.26.0",
+  "pydantic>=2.0.0",
+  "PyMuPDF>=1.24.0",
+  "Pillow>=10.0.0",
+  "pytesseract>=0.3.10",
+  "markitdown[all]>=0.1.0",
+  "sentence-transformers>=2.7.0",
+  "python-dotenv>=1.0.0",
+  "python-multipart>=0.0.9",
+  "qdrant-client>=1.9.0",
+  "langchain-core>=0.3.0",
+  "langchain-openai>=0.3.0",
+  "langchain-anthropic>=0.3.0",
+  "langgraph>=1.1,<2",
+  "langgraph-checkpoint-postgres>=3.0.0",
+  "httpx>=0.28.0",
+  "redis>=5.0.0",
+  "hiredis>=2.0.0",
+  "celery[redis]>=5.4.0",
+  "bcrypt>=4.0.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0.0"]
+evaluation = [
+  "ipykernel>=6.29.0",
+  "jupyterlab>=4.2.0",
+  "matplotlib>=3.9.0",
+  "ragas>=0.4.3,<0.5.0",
+  # RAGAS 0.4.x imports a compatibility module removed in 0.4.x.
+  "langchain-community>=0.3.0,<0.4.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
