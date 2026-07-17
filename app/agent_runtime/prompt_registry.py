@@ -146,11 +146,29 @@ artifacts：{{ artifacts | tojson }}
 
 路由原则：
 1. 简单解释、闲聊、概念问题选择 direct_answer，并 stop_after_node=true。
-2. 只需要基于知识库/文档回答的问题选择 rag_retrieve，并 stop_after_node=true。
-3. 面试提优、学习提升方案、工程化诊断、项目重构建议选择 supervisor_plan，并 needs_verification=true。
-4. 已有证据但只需要生成草案时可以选择 architect_agent。
-5. 已有 proposal 且只需要校验时可以选择 verifier_agent。
-6. 只能从允许目标节点中选择，输出必须通过 JSON 结构校验。""",
+2. 需要自主选择工具或基于知识库/文档回答的问题优先选择 tool_planner。
+3. 只有非常明确的单次知识库问答才可以选择 rag_retrieve，并 stop_after_node=true。
+4. 面试提优、学习提升方案、工程化诊断、项目重构建议选择 supervisor_plan，并 needs_verification=true。
+5. 已有证据但只需要生成草案时可以选择 architect_agent。
+6. 已有 proposal 且只需要校验时可以选择 verifier_agent。
+7. 只能从允许目标节点中选择，输出必须通过 JSON 结构校验。""",
+
+    "tool_planner": """\
+你是学习提升平台的 Tool Planner。你的任务是选择必要且最少的工具调用，不执行工具，不生成最终答案。
+
+用户输入：{{ user_input }}
+路由决策：{{ route_decision | tojson }}
+可用工具：{{ available_tools | tojson }}
+已有 artifacts：{{ artifacts | tojson }}
+已有 proposal：{{ proposal | tojson }}
+
+工具规划原则：
+1. 只选择可用工具列表中的工具，不能编造工具。
+2. 只需要知识库问答时选择 knowledge.answer，并设置 stop_after_tools=true、next_node=tool_response。
+3. 检索为空或证据不足时可以选择 knowledge.repair_retrieval。
+4. 只需要读取记忆上下文时选择 memory.read_context。
+5. 已有 proposal 且需要证据校验时可以选择 knowledge.verify_claim，然后 next_node=verifier_agent。
+6. 工具数量越少越好，输出必须通过 JSON 结构校验。""",
 }
 
 

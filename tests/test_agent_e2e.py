@@ -24,6 +24,8 @@ from app.agent_runtime.planner import (
     ProposalSection,
     ResearchTask,
     RouteDecision,
+    ToolCallSpec,
+    ToolPlanDecision,
     UpgradeProposal,
     VerificationDecision,
     default_plan,
@@ -44,9 +46,6 @@ from app.agent_runtime.schemas import (
     validate_router_route,
     validate_verification_route,
 )
-from app.agent_runtime.tools import call_tool
-
-
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
@@ -179,7 +178,7 @@ class TestHappyPath:
     def _setup_mocks(self):
         """Mock the tool gateway so research agents get controlled results."""
         with patch(
-            "app.agent_runtime.runtime.call_tool",
+            "app.agent_runtime.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ), patch(
             "app.agent_runtime.runtime.record_memory_event",
@@ -338,7 +337,7 @@ class TestRouterPathSelection:
                 None,
             ),
         ), patch(
-            "app.agent_runtime.runtime.call_tool",
+            "app.agent_runtime.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ):
             graph = build_agent_graph(store, checkpointer=MemorySaver())
@@ -357,6 +356,69 @@ class TestRouterPathSelection:
         assert len(store.tool_calls) == 1
         assert len(store.verifications) == 0
 
+    def test_tool_planner_executes_tools_and_returns_feedback_response(self):
+        from langgraph.checkpoint.memory import MemorySaver
+
+        store = FakeStore()
+        state = _make_base_state(task_type="rag_question", user_input="根据知识库回答 TCP 三次握手", kb_id=1)
+
+        with patch(
+            "app.agent_runtime.runtime.generate_route",
+            return_value=(
+                RouteDecision(
+                    target_node="tool_planner",
+                    intent="rag_question",
+                    reason="needs autonomous tool selection",
+                    confidence=0.9,
+                    needs_rag=True,
+                    needs_verification=False,
+                    stop_after_node=True,
+                    response_mode="rag_answer",
+                    query="TCP 三次握手",
+                ),
+                "mock",
+                None,
+            ),
+        ), patch(
+            "app.agent_runtime.runtime.generate_tool_plan",
+            return_value=(
+                ToolPlanDecision(
+                    calls=[
+                        ToolCallSpec(
+                            call_id="tool-1",
+                            tool_name="knowledge.answer",
+                            arguments={"query": "TCP 三次握手", "top_k": 5},
+                            reason="retrieve grounded answer",
+                        )
+                    ],
+                    stop_after_tools=True,
+                    next_node="tool_response",
+                    reason="answer after retrieval",
+                    confidence=0.88,
+                ),
+                "mock",
+                None,
+            ),
+        ), patch(
+            "app.agent_runtime.tool_manager.call_tool",
+            return_value=_fake_research_result(ok=True, citations=True),
+        ):
+            graph = build_agent_graph(store, checkpointer=MemorySaver())
+            config = {"configurable": {"thread_id": state["task_id"]}}
+
+            for _ in graph.stream(state, config=config, stream_mode="updates"):
+                pass
+
+        final = dict(graph.get_state(config).values)
+        event_types = {event["event_type"] for event in store.events}
+        assert final["status"] == "completed"
+        assert final["tool_feedback"]["success_count"] == 1
+        assert final["tool_feedback"]["next_node"] == "tool_response"
+        assert "tool.plan_created" in event_types
+        assert "tool.feedback_ready" in event_types
+        assert len(store.tool_calls) == 1
+        assert len(store.verifications) == 0
+
 
 # ── repair loop E2E ─────────────────────────────────────────────────────────
 
@@ -369,7 +431,7 @@ class TestRepairLoop:
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         with patch(
-            "app.agent_runtime.runtime.call_tool",
+            "app.agent_runtime.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ), patch(
             "app.agent_runtime.runtime.record_memory_event",
@@ -467,7 +529,7 @@ class TestFallbackPath:
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         with patch(
-            "app.agent_runtime.runtime.call_tool",
+            "app.agent_runtime.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=False),
         ), patch(
             "app.agent_runtime.runtime.record_memory_event",
@@ -534,7 +596,7 @@ class TestBudgetEnforcement:
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         with patch(
-            "app.agent_runtime.runtime.call_tool",
+            "app.agent_runtime.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ), patch(
             "app.agent_runtime.runtime.record_memory_event",
@@ -604,7 +666,7 @@ class TestCancellation:
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         with patch(
-            "app.agent_runtime.runtime.call_tool",
+            "app.agent_runtime.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ), patch(
             "app.agent_runtime.runtime.record_memory_event",
@@ -653,7 +715,7 @@ class TestStateRoundTrip:
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         with patch(
-            "app.agent_runtime.runtime.call_tool",
+            "app.agent_runtime.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ), patch(
             "app.agent_runtime.runtime.record_memory_event",
@@ -799,7 +861,7 @@ class TestAgentTaskStateInvariants:
         )
         # The graph should preserve pre-existing artifacts and add more.
         with patch(
-            "app.agent_runtime.runtime.call_tool",
+            "app.agent_runtime.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ), patch(
             "app.agent_runtime.runtime.record_memory_event",

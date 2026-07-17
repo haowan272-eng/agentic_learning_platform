@@ -10,8 +10,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 TaskStatus = Literal["pending", "running", "waiting_user", "completed", "failed", "cancelled"]
 NextAction = Literal["dispatch", "repair", "replan", "ask_user", "fallback", "complete"]
-RouterRoute = Literal["direct_answer", "rag_retrieve", "supervisor_plan", "architect_agent", "verifier_agent", "final_response", "fallback_response"]
+RouterRoute = Literal["direct_answer", "rag_retrieve", "tool_planner", "supervisor_plan", "architect_agent", "verifier_agent", "final_response", "fallback_response"]
 ArchitectRoute = Literal["verifier_agent", "final_response"]
+ToolExecutorRoute = Literal["tool_response", "architect_agent", "verifier_agent", "fallback_response"]
 PlanRoute = Literal["approval_gate", "dispatch_research"]
 VerificationRoute = Literal["final_response", "repair_plan", "approval_gate", "fallback_response"]
 
@@ -79,6 +80,8 @@ class AgentTaskState(TypedDict, total=False):
     route_decision: dict[str, Any]
     route_source: str
     route_error: str | None
+    tool_plan: dict[str, Any]
+    tool_feedback: dict[str, Any]
     plan: dict[str, Any]
     planning_source: str
     planner_error: str | None
@@ -239,6 +242,8 @@ class AgentTaskStateModel(RuntimeModel):
     route_decision: dict[str, Any] = Field(default_factory=dict)
     route_source: str | None = Field(default=None, max_length=128)
     route_error: str | None = Field(default=None, max_length=4000)
+    tool_plan: dict[str, Any] = Field(default_factory=dict)
+    tool_feedback: dict[str, Any] = Field(default_factory=dict)
     plan: dict[str, Any] = Field(default_factory=dict)
     planning_source: str | None = Field(default=None, max_length=128)
     planner_error: str | None = Field(default=None, max_length=4000)
@@ -282,6 +287,8 @@ class NodeUpdateModel(RuntimeModel):
     route_decision: dict[str, Any] | None = None
     route_source: str | None = Field(default=None, max_length=128)
     route_error: str | None = Field(default=None, max_length=4000)
+    tool_plan: dict[str, Any] | None = None
+    tool_feedback: dict[str, Any] | None = None
     plan: dict[str, Any] | None = None
     goal: str | None = Field(default=None, max_length=8000)
     intent: str | None = Field(default=None, max_length=128)
@@ -312,6 +319,10 @@ class RouterRouteModel(RuntimeModel):
 
 class ArchitectRouteModel(RuntimeModel):
     route: ArchitectRoute
+
+
+class ToolExecutorRouteModel(RuntimeModel):
+    route: ToolExecutorRoute
 
 
 class VerificationRouteModel(RuntimeModel):
@@ -348,6 +359,10 @@ def validate_router_route(route: str) -> RouterRoute:
 
 def validate_architect_route(route: str) -> ArchitectRoute:
     return ArchitectRouteModel(route=route).route
+
+
+def validate_tool_executor_route(route: str) -> ToolExecutorRoute:
+    return ToolExecutorRouteModel(route=route).route
 
 
 def validate_verification_route(route: str) -> VerificationRoute:

@@ -49,6 +49,27 @@ class RouteDecision(BaseModel):
     query: str | None = Field(default=None, max_length=2000)
 
 
+class ToolCallSpec(BaseModel):
+    call_id: str = Field(default_factory=lambda: f"tool-{uuid4().hex[:8]}", min_length=1, max_length=128)
+    tool_name: Literal[
+        "knowledge.answer",
+        "knowledge.repair_retrieval",
+        "knowledge.verify_claim",
+        "memory.read_profile",
+        "memory.read_context",
+    ]
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
+class ToolPlanDecision(BaseModel):
+    calls: list[ToolCallSpec] = Field(..., min_length=1, max_length=4)
+    stop_after_tools: bool
+    next_node: Literal["tool_response", "architect_agent", "verifier_agent", "fallback_response"]
+    reason: str = Field(..., min_length=1, max_length=1000)
+    confidence: float = Field(ge=0, le=1)
+
+
 class ProposalSection(BaseModel):
     title: str = Field(..., min_length=1, max_length=120)
     items: list[str] = Field(..., min_length=1, max_length=8)
@@ -117,9 +138,9 @@ def default_route_decision(state: dict[str, Any], *, reason: str | None = None) 
 
     if has_rag_scope or any(term in text for term in rag_terms):
         return RouteDecision(
-            target_node="rag_retrieve",
+            target_node="tool_planner",
             intent="rag_question",
-            reason=reason or "用户主要需要基于知识库或文档材料的检索回答，不需要完整方案生成。",
+            reason=reason or "用户主要需要基于知识库或文档材料回答，交给 Tool Planner 自主选择工具。",
             confidence=0.68,
             needs_rag=True,
             needs_verification=False,
@@ -154,6 +175,39 @@ def default_route_decision(state: dict[str, Any], *, reason: str | None = None) 
     )
 
 
+def default_tool_plan(state: dict[str, Any], *, reason: str | None = None) -> ToolPlanDecision:
+    decision = state.get("route_decision") or {}
+    query = str(decision.get("query") or state.get("user_input") or "").strip()
+    has_proposal = bool(state.get("proposal"))
+    if has_proposal:
+        return ToolPlanDecision(
+            calls=[
+                ToolCallSpec(
+                    tool_name="knowledge.verify_claim",
+                    arguments={"s2": state.get("proposal") or {}, "knowledge": {"citations": state.get("citations") or [], "grounding": state.get("grounding") or {}}},
+                    reason="已有方案时优先检查证据支撑。",
+                )
+            ],
+            stop_after_tools=False,
+            next_node="verifier_agent",
+            reason=reason or "使用确定性工具计划校验已有方案。",
+            confidence=0.62,
+        )
+    return ToolPlanDecision(
+        calls=[
+            ToolCallSpec(
+                tool_name="knowledge.answer",
+                arguments={"query": query, "top_k": 5, "use_memory": True, "rewrite_query": True},
+                reason="需要先检索知识库或文档证据。",
+            )
+        ],
+        stop_after_tools=True,
+        next_node="tool_response",
+        reason=reason or "使用确定性工具计划完成轻量检索回答。",
+        confidence=0.66,
+    )
+
+
 def _render_prompt(name: str, variables: dict[str, Any], *, role: str = "planner", state: dict[str, Any] | None = None) -> str:
     """Render a prompt via the registry, with few-shot example injection."""
     result = prompt_registry.render(name, variables, role=role)
@@ -182,9 +236,33 @@ def _router_prompt(state: dict[str, Any]) -> str:
         "existing_artifact_count": len(state.get("artifacts", []) or []),
         "has_proposal": bool(state.get("proposal")),
         "allowed_targets": [
-            "direct_answer", "rag_retrieve", "supervisor_plan", "architect_agent",
+            "direct_answer", "rag_retrieve", "tool_planner", "supervisor_plan", "architect_agent",
             "verifier_agent", "final_response", "fallback_response",
         ],
+    }, role="planner", state=state)
+
+
+def _tool_planner_prompt(state: dict[str, Any]) -> str:
+    try:
+        from app.agent_runtime.tools import list_tools
+        available_tools = [
+            {
+                "name": item["name"],
+                "category": item["category"],
+                "description": item["description"],
+                "risk_level": item["risk_level"],
+                "side_effect": item["side_effect"],
+            }
+            for item in list_tools()
+        ]
+    except Exception:
+        available_tools = []
+    return _render_prompt("tool_planner", {
+        "user_input": state.get("user_input", ""),
+        "route_decision": state.get("route_decision", {}),
+        "available_tools": available_tools,
+        "artifacts": state.get("artifacts", []),
+        "proposal": state.get("proposal", {}),
     }, role="planner", state=state)
 
 
@@ -308,6 +386,21 @@ def generate_route(
         error = f"Router LLM call failed; applied deterministic route: {exc}"
         logger.warning(error)
         return default_route_decision(state, reason=error), "fallback", error
+
+
+def generate_tool_plan(
+    state: dict[str, Any], *, on_token: TokenCallback | None = None,
+) -> tuple[ToolPlanDecision, str, str | None]:
+    try:
+        decision, source, _ptk, _ctk = _invoke_structured(
+            "planner", _tool_planner_prompt(state), ToolPlanDecision, on_token,
+            template_name="tool_planner", task_id=str(state.get("task_id", "")),
+        )
+        return decision, source, None  # type: ignore[return-value]
+    except Exception as exc:  # noqa: BLE001
+        error = f"Tool Planner LLM call failed; applied deterministic tool plan: {exc}"
+        logger.warning(error)
+        return default_tool_plan(state, reason=error), "fallback", error
 
 
 def generate_plan(

@@ -9,10 +9,10 @@ from app.agent_runtime.event_bus import publish_task_event
 from app.core.config import DATABASE_URL, LANGGRAPH_CHECKPOINT_SETUP
 from app.memory.service import build_context_for_state, consolidate_task_memory, record_memory_event, summarize_task_session
 from app.memory.short_term import append_recent_event
-from app.observability import increment, observe_ms
+from app.observability import increment
 
 from .llm_gateway import llm_gateway
-from .planner import AgentPlan, ResearchTask, generate_plan, generate_proposal, generate_route, verify_proposal
+from .planner import AgentPlan, ResearchTask, generate_plan, generate_proposal, generate_route, generate_tool_plan, verify_proposal
 from .schemas import (
     AgentEvent,
     AgentMessage,
@@ -27,9 +27,10 @@ from .schemas import (
     validate_plan_route,
     validate_research_work_item,
     validate_router_route,
+    validate_tool_executor_route,
     validate_verification_route,
 )
-from .tools import call_tool
+from .tool_manager import execute_managed_tool
 from .feedback import FailureSignal, get_feedback_summary_for_prompt, record_verification_failure
 
 try:
@@ -195,32 +196,17 @@ def _rag_retrieve(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
     decision = state.get("route_decision") or {}
     query = str(decision.get("query") or state.get("user_input") or "")
     start = _event(state, store, "agent.started", "Router dispatched a lightweight RAG retrieval.", agent_name="rag_retrieve", payload={"query": query})
-    result = call_tool(
-        "knowledge.answer",
-        {
-            "query": query,
-            "username": state["username"],
-            "user_id": state.get("user_id"),
-            "kb_id": state.get("kb_id"),
-            "document_id": state.get("document_id"),
-            "conversation_id": state.get("conversation_id"),
-            "top_k": 5,
-            "use_memory": True,
-            "rewrite_query": True,
-        },
-        agent="research_agent",
+    execution = execute_managed_tool(
+        state,
+        store,
+        tool_name="knowledge.answer",
+        arguments={"query": query, "top_k": 5, "use_memory": True, "rewrite_query": True},
+        agent_name="research_agent",
+        skill_name="knowledge_grounding",
+        step_id="rag_retrieve",
     )
-    artifact: Artifact = {
-        "artifact_id": f"rag-{uuid4().hex[:12]}",
-        "kind": "research",
-        "producer": "rag_retrieve",
-        "correlation_id": "rag_retrieve",
-        "data": result.get("data") or {},
-        "citations": result.get("citations") or [],
-        "confidence": float(result.get("confidence") or 0),
-        "error": result.get("error"),
-    }
-    store.save_tool_call({"task_id": state["task_id"], "run_id": state["run_id"], "step_id": "rag_retrieve", "agent_name": "rag_retrieve", "skill_name": "knowledge_grounding", "tool_name": "knowledge.answer", "input": {"query": query, "top_k": 5}, "output": result, "result": result, "ok": bool(result.get("ok")), "error_type": (result.get("error") or {}).get("type"), "error_message": (result.get("error") or {}).get("message"), "retry_count": 0, "latency_ms": result.get("latency_ms")})
+    result = execution.result
+    artifact = {**execution.artifact, "producer": "rag_retrieve"}
     answer = str((result.get("data") or {}).get("answer") or "")
     if not answer:
         answer = "当前没有检索到足够的知识库内容。请先上传并完成索引，或换一个更具体的问题。"
@@ -245,6 +231,148 @@ def _rag_retrieve(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
     if result.get("error"):
         update["errors"] = [{"source": "rag_retrieve", "error_type": (result.get("error") or {}).get("type", "rag_failed"), "message": (result.get("error") or {}).get("message", "RAG retrieval failed."), "retryable": bool((result.get("error") or {}).get("retryable", True)), "correlation_id": "rag_retrieve"}]
     return validate_node_update(update)
+
+
+def _tool_planner(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
+    plan, source, error = generate_tool_plan(state, on_token=_llm_token_callback(state, "tool_planner"))
+    plan_payload = plan.model_dump(mode="json")
+    event = _event(
+        state,
+        store,
+        "tool.plan_created",
+        "Tool Planner created an autonomous tool call plan.",
+        agent_name="tool_planner",
+        payload={"source": source, "plan": plan_payload, "error": error},
+    )
+    return validate_node_update({
+        "tool_plan": {**plan_payload, "source": source, "error": error},
+        "emitted_events": [event],
+    })
+
+
+def _tool_executor(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
+    plan = state.get("tool_plan") or {}
+    calls = list(plan.get("calls") or [])
+    artifacts: list[Artifact] = []
+    errors: list[dict[str, Any]] = []
+    result_summaries: list[dict[str, Any]] = []
+    emitted_events: list[AgentEvent] = []
+
+    for index, call in enumerate(calls[:4]):
+        tool_name = str(call.get("tool_name") or "")
+        arguments = dict(call.get("arguments") or {})
+        call_id = str(call.get("call_id") or f"tool-{index + 1}")
+        started = _event(state, store, "tool.started", f"Executing {tool_name}.", agent_name="tool_executor", tool_name=tool_name, step_id=call_id, payload={"reason": call.get("reason")})
+        emitted_events.append(started)
+        execution = execute_managed_tool(
+            state,
+            store,
+            tool_name=tool_name,
+            arguments=arguments,
+            agent_name="executor",
+            skill_name="autonomous_tool_use",
+            step_id=call_id,
+            call_id=call_id,
+        )
+        artifacts.append(execution.artifact)
+        result = execution.result
+        error = result.get("error") or {}
+        result_summaries.append({
+            "call_id": call_id,
+            "tool_name": tool_name,
+            "ok": bool(result.get("ok")),
+            "artifact_id": execution.artifact["artifact_id"],
+            "confidence": float(result.get("confidence") or 0),
+            "grounding": result.get("grounding") or {},
+            "error": error or None,
+        })
+        done = _event(state, store, "tool.completed" if result.get("ok") else "tool.failed", f"Tool {tool_name} completed.", agent_name="tool_executor", tool_name=tool_name, step_id=call_id, payload=result_summaries[-1])
+        emitted_events.append(done)
+        if error:
+            errors.append({"source": "tool_executor", "error_type": error.get("type", "tool_failed"), "message": error.get("message", "Tool execution failed."), "retryable": bool(error.get("retryable", True)), "correlation_id": call_id})
+        if tool_name == "knowledge.answer" and error.get("retryable", True) and not result.get("ok"):
+            repair_id = f"{call_id}-repair"
+            repair_event = _event(state, store, "tool.feedback_repair", "Tool feedback triggered retrieval repair.", agent_name="tool_executor", tool_name="knowledge.repair_retrieval", step_id=repair_id, payload={"failed_call_id": call_id, "error": error})
+            emitted_events.append(repair_event)
+            repair_execution = execute_managed_tool(
+                state,
+                store,
+                tool_name="knowledge.repair_retrieval",
+                arguments={**arguments, "repair_reason": error.get("type") or "retrieval_insufficient"},
+                agent_name="executor",
+                skill_name="autonomous_tool_use",
+                step_id=repair_id,
+                call_id=repair_id,
+            )
+            artifacts.append(repair_execution.artifact)
+            repair_result = repair_execution.result
+            repair_error = repair_result.get("error") or {}
+            result_summaries.append({
+                "call_id": repair_id,
+                "tool_name": "knowledge.repair_retrieval",
+                "ok": bool(repair_result.get("ok")),
+                "artifact_id": repair_execution.artifact["artifact_id"],
+                "confidence": float(repair_result.get("confidence") or 0),
+                "grounding": repair_result.get("grounding") or {},
+                "error": repair_error or None,
+                "feedback_for": call_id,
+            })
+            repair_done = _event(state, store, "tool.completed" if repair_result.get("ok") else "tool.failed", "Retrieval repair completed.", agent_name="tool_executor", tool_name="knowledge.repair_retrieval", step_id=repair_id, payload=result_summaries[-1])
+            emitted_events.append(repair_done)
+            if repair_error:
+                errors.append({"source": "tool_executor", "error_type": repair_error.get("type", "tool_failed"), "message": repair_error.get("message", "Tool repair failed."), "retryable": bool(repair_error.get("retryable", True)), "correlation_id": repair_id})
+
+    success_count = len([item for item in result_summaries if item.get("ok")])
+    retryable_failures = len([item for item in result_summaries if (item.get("error") or {}).get("retryable")])
+    planned_next = str(plan.get("next_node") or "tool_response")
+    if success_count == 0 and result_summaries and retryable_failures == 0:
+        next_node = "fallback_response"
+    elif bool(plan.get("stop_after_tools", True)):
+        next_node = "tool_response"
+    else:
+        next_node = planned_next
+    feedback = {
+        "success_count": success_count,
+        "failure_count": max(0, len(result_summaries) - success_count),
+        "retryable_failures": retryable_failures,
+        "next_node": next_node,
+        "results": result_summaries,
+    }
+    event = _event(state, store, "tool.feedback_ready", "Tool Executor produced structured feedback.", agent_name="tool_executor", payload=feedback)
+    emitted_events.append(event)
+    return validate_node_update({"tool_feedback": feedback, "artifacts": artifacts, "errors": errors, "emitted_events": emitted_events})
+
+
+def _tool_executor_route(state: AgentTaskState) -> str:
+    state = validate_agent_state(state)
+    feedback = state.get("tool_feedback") or {}
+    return validate_tool_executor_route(str(feedback.get("next_node") or "tool_response"))
+
+
+def _tool_response(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
+    feedback = state.get("tool_feedback") or {}
+    artifacts = state.get("artifacts") or []
+    answer = ""
+    for artifact in reversed(artifacts):
+        data = artifact.get("data") or {}
+        if data.get("answer"):
+            answer = str(data["answer"])
+            break
+    if not answer:
+        answer = "工具已执行，但没有形成足够明确的答案。请补充材料或换一个更具体的问题。"
+    citations = [citation for artifact in artifacts for citation in artifact.get("citations", [])]
+    grounding = next((artifact.get("grounding") for artifact in reversed(artifacts) if artifact.get("grounding")), None)
+    event = _event(state, store, "task.completed", "Tool response completed from autonomous tool feedback.", agent_name="tool_response", payload={"tool_feedback": feedback})
+    return validate_node_update({
+        "status": "completed",
+        "final_answer": answer,
+        "citations": citations,
+        "grounding": grounding or {"mode": "tool_response", "rag_used": bool(citations)},
+        "emitted_events": [event],
+    })
 
 
 def _supervisor_plan(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
@@ -342,21 +470,17 @@ def _research_agent(work: ResearchWorkItem, store: RuntimeStore) -> dict[str, An
             "emitted_events": [event],
         })
     start = _event(work, store, "agent.started", work["objective"], agent_name="research_agent", payload={"correlation_id": work["correlation_id"]})
-    result = call_tool(
-        "knowledge.answer",
-        {
-            "query": work["query"], "username": work["username"],
-            "user_id": work.get("user_id"), "kb_id": work.get("kb_id"),
-            "document_id": work.get("document_id"), "conversation_id": work.get("conversation_id"),
-            "top_k": work.get("top_k", 5), "use_memory": True, "rewrite_query": True,
-        },
-        agent="research_agent",
+    execution = execute_managed_tool(
+        work,
+        store,
+        tool_name="knowledge.answer",
+        arguments={"query": work["query"], "top_k": work.get("top_k", 5), "use_memory": True, "rewrite_query": True},
+        agent_name="research_agent",
+        skill_name="knowledge_grounding",
+        step_id=work["correlation_id"],
     )
-    observe_ms("agent_tool_latency_ms", float(result.get("latency_ms") or 0), {"tool": "knowledge.answer", "ok": bool(result.get("ok"))})
-    increment("agent_tool_calls_total", {"tool": "knowledge.answer", "ok": bool(result.get("ok"))})
-    usage = result.get("usage") or {}
-    artifact: Artifact = {"artifact_id": f"research-{uuid4().hex[:12]}", "kind": "research", "producer": "research_agent", "correlation_id": work["correlation_id"], "data": result.get("data") or {}, "citations": result.get("citations") or [], "confidence": float(result.get("confidence") or 0), "error": result.get("error")}
-    store.save_tool_call({"task_id": work["task_id"], "run_id": work["run_id"], "step_id": work["correlation_id"], "agent_name": "research_agent", "skill_name": "knowledge_grounding", "tool_name": "knowledge.answer", "input": {"query": work["query"], "top_k": work.get("top_k", 5)}, "output": result, "result": result, "ok": bool(result.get("ok")), "error_type": (result.get("error") or {}).get("type"), "error_message": (result.get("error") or {}).get("message"), "retry_count": 0, "latency_ms": result.get("latency_ms")})
+    result = execution.result
+    artifact: Artifact = execution.artifact
     done = _event(work, store, "agent.completed" if result.get("ok") else "agent.failed", "Research Agent finished.", agent_name="research_agent", tool_name="knowledge.answer", step_id=work["correlation_id"], payload={"artifact_id": artifact["artifact_id"], "ok": bool(result.get("ok"))})
     message: AgentMessage = {"message_id": str(uuid4()), "from_agent": "research_agent", "to_agent": "architect_agent", "kind": "result", "correlation_id": work["correlation_id"], "payload": {"artifact_id": artifact["artifact_id"]}}
     updates: dict[str, Any] = {"artifacts": [artifact], "messages": [message], "emitted_events": [start, done]}
@@ -469,6 +593,9 @@ def build_agent_graph(store: RuntimeStore, *, checkpointer: Any) -> Any:
     builder.add_node("llm_router", lambda state: _llm_router(state, store))
     builder.add_node("direct_answer", lambda state: _direct_answer(state, store))
     builder.add_node("rag_retrieve", lambda state: _rag_retrieve(state, store))
+    builder.add_node("tool_planner", lambda state: _tool_planner(state, store))
+    builder.add_node("tool_executor", lambda state: _tool_executor(state, store))
+    builder.add_node("tool_response", lambda state: _tool_response(state, store))
     builder.add_node("supervisor_plan", lambda state: _supervisor_plan(state, store))
     builder.add_node("approval_gate", lambda state: _approval_gate(state, store))
     builder.add_node("dispatch_research", lambda state: state)
@@ -482,12 +609,15 @@ def build_agent_graph(store: RuntimeStore, *, checkpointer: Any) -> Any:
     builder.add_conditional_edges("llm_router", _router_route, {
         "direct_answer": "direct_answer",
         "rag_retrieve": "rag_retrieve",
+        "tool_planner": "tool_planner",
         "supervisor_plan": "supervisor_plan",
         "architect_agent": "architect_agent",
         "verifier_agent": "verifier_agent",
         "final_response": "final_response",
         "fallback_response": "fallback_response",
     })
+    builder.add_edge("tool_planner", "tool_executor")
+    builder.add_conditional_edges("tool_executor", _tool_executor_route, {"tool_response": "tool_response", "architect_agent": "architect_agent", "verifier_agent": "verifier_agent", "fallback_response": "fallback_response"})
     builder.add_conditional_edges("supervisor_plan", _plan_route, {"approval_gate": "approval_gate", "dispatch_research": "dispatch_research"})
     # Dynamically fan-out research tasks via Send; Architect runs as a fan-in
     # barrier once every dispatched Research Agent has completed.
@@ -498,6 +628,7 @@ def build_agent_graph(store: RuntimeStore, *, checkpointer: Any) -> Any:
     builder.add_edge("repair_plan", "dispatch_research")
     builder.add_edge("direct_answer", END)
     builder.add_edge("rag_retrieve", END)
+    builder.add_edge("tool_response", END)
     builder.add_edge("final_response", END)
     builder.add_edge("fallback_response", END)
     return builder.compile(checkpointer=checkpointer)
