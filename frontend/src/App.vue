@@ -25,7 +25,7 @@ import {
   XCircle
 } from "@lucide/vue";
 import {
-  answerQuestion,
+  answerQuestionStream,
   cancelAgentTask,
   createAgentTask,
   createKnowledgeBase,
@@ -37,6 +37,7 @@ import {
   register,
   tokenStore,
   uploadDocument,
+  type AnswerQuestionPayload,
   type AgentEvent,
   type AgentTask,
   type AnswerResponse,
@@ -120,6 +121,54 @@ const failedDocs = computed(() => state.docs.filter((doc) => doc.status === "fai
 
 function messageFromError(error: unknown, fallback: string) {
   return error instanceof Error && error.message ? error.message : fallback;
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function emptyAnswer(payload: AnswerQuestionPayload): AnswerResponse {
+  return {
+    query: payload.query,
+    rewritten_query: null,
+    answer: "",
+    conversation_id: payload.conversation_id ?? 0,
+    citations: [],
+    retrieved_count: 0,
+    degraded: false,
+    context_compacted: false,
+    timings_ms: {}
+  };
+}
+
+function createTypewriter(onText: (text: string) => void) {
+  let queue = "";
+  let running = true;
+
+  const loop = async () => {
+    while (running || queue.length > 0) {
+      if (!queue) {
+        await wait(16);
+        continue;
+      }
+      const size = queue.length > 160 ? 5 : queue.length > 60 ? 3 : 1;
+      const chunk = queue.slice(0, size);
+      queue = queue.slice(size);
+      onText(chunk);
+      await wait(size > 1 ? 6 : 14);
+    }
+  };
+
+  const task = loop();
+  return {
+    push(text: string) {
+      queue += text;
+    },
+    async stop() {
+      running = false;
+      await task;
+    }
+  };
 }
 
 async function submitAuth() {
@@ -216,20 +265,42 @@ async function askRag() {
   if (!state.query.trim()) return;
   state.busy = true;
   state.error = "";
+  const payload: AnswerQuestionPayload = {
+    query: state.query.trim(),
+    kb_id: state.selectedKbId || undefined,
+    document_id: state.selectedDocId || undefined,
+    conversation_id: state.conversationId || undefined,
+    top_k: Number(state.topK),
+    bm25_weight: Number(state.bm25Weight),
+    use_memory: state.useMemory,
+    rewrite_query: state.rewriteQuery
+  };
+  state.answer = emptyAnswer(payload);
+  const typewriter = createTypewriter((text) => {
+    if (state.answer) state.answer.answer += text;
+  });
   try {
-    const result = await answerQuestion({
-      query: state.query.trim(),
-      kb_id: state.selectedKbId || undefined,
-      document_id: state.selectedDocId || undefined,
-      conversation_id: state.conversationId || undefined,
-      top_k: Number(state.topK),
-      bm25_weight: Number(state.bm25Weight),
-      use_memory: state.useMemory,
-      rewrite_query: state.rewriteQuery
+    const result = await answerQuestionStream(payload, {
+      onToken(delta) {
+        typewriter.push(delta);
+      },
+      onFinal(finalAnswer) {
+        if (state.answer) {
+          state.answer.rewritten_query = finalAnswer.rewritten_query;
+          state.answer.conversation_id = finalAnswer.conversation_id;
+          state.answer.citations = finalAnswer.citations;
+          state.answer.retrieved_count = finalAnswer.retrieved_count;
+          state.answer.degraded = finalAnswer.degraded;
+          state.answer.context_compacted = finalAnswer.context_compacted;
+          state.answer.timings_ms = finalAnswer.timings_ms;
+        }
+      }
     });
+    await typewriter.stop();
     state.answer = result;
     state.conversationId = result.conversation_id;
   } catch (error) {
+    await typewriter.stop();
     state.error = messageFromError(error, "问答失败。");
   } finally {
     state.busy = false;
@@ -422,7 +493,7 @@ onMounted(() => {
             </div>
             <div class="workspace-actions">
               <button class="secondary-button task-toggle" :disabled="state.busy" @click="bootstrap"><RefreshCw :size="15" />刷新</button>
-              <button class="primary-button task-toggle" :disabled="state.taskBusy" @click="startAgentReview"><Sparkles :size="15" />Agent 复盘</button>
+              <button class="primary-button task-toggle" :disabled="state.taskBusy || state.busy" @click="startAgentReview"><Sparkles :size="15" />Agent 复盘</button>
             </div>
           </header>
 
@@ -469,7 +540,7 @@ onMounted(() => {
                   <span class="status-badge completed">{{ state.answer.retrieved_count }} chunks</span>
                 </div>
                 <p v-if="state.answer.rewritten_query" class="rewritten">改写问题：{{ state.answer.rewritten_query }}</p>
-                <pre>{{ state.answer.answer }}</pre>
+                <pre :class="{ typing: state.busy }">{{ state.answer.answer }}</pre>
               </article>
 
               <aside class="citation-panel">

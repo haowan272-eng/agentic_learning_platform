@@ -166,6 +166,8 @@ button:disabled { cursor: not-allowed; opacity: .58; transform: none !important;
 .empty-constellation i:nth-of-type(2) { right: 9px; bottom: 7px; background: var(--ochre); }
 .answer-layout { margin-top: 15px; display: grid; grid-template-columns: minmax(0,1.2fr) minmax(260px,.8fr); gap: 15px; align-items: start; }
 .answer-card pre, .final-answer pre { margin: 14px 0 0; white-space: pre-wrap; color: #34443c; font: 12px/1.78 inherit; }
+.answer-card pre.typing::after { content: "|"; display: inline-block; margin-left: 2px; color: var(--accent); animation: caretBlink 1s steps(2, start) infinite; }
+@keyframes caretBlink { 50% { opacity: 0; } }
 .rewritten { padding: 10px; border-radius: 9px; background: #f6f6f2; color: var(--muted); font-size: 11px; line-height: 1.6; }
 .citation-panel { display: grid; gap: 10px; }
 .citation-card { padding: 12px; border: 1px solid var(--line-soft); border-radius: 10px; background: #fff; }

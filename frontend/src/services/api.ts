@@ -47,6 +47,17 @@ export type AnswerResponse = {
   timings_ms: Record<string, number>;
 };
 
+export type AnswerQuestionPayload = {
+  query: string;
+  kb_id?: number;
+  document_id?: number;
+  conversation_id?: number;
+  top_k: number;
+  bm25_weight: number;
+  use_memory: boolean;
+  rewrite_query: boolean;
+};
+
 export type AgentTask = {
   session_id: string;
   task_id: string;
@@ -176,20 +187,88 @@ export async function uploadDocument(file: File, kbId?: number) {
   return response.json();
 }
 
-export function answerQuestion(payload: {
-  query: string;
-  kb_id?: number;
-  document_id?: number;
-  conversation_id?: number;
-  top_k: number;
-  bm25_weight: number;
-  use_memory: boolean;
-  rewrite_query: boolean;
-}) {
+export function answerQuestion(payload: AnswerQuestionPayload) {
   return requestJson<AnswerResponse>("/embedding/rag/answer", {
     method: "POST",
     body: JSON.stringify(payload)
   });
+}
+
+type StreamHandlers = {
+  onToken?: (delta: string) => void;
+  onFinal?: (response: AnswerResponse) => void;
+};
+
+function parseSseBlock(block: string) {
+  let event = "message";
+  const data: string[] = [];
+  for (const rawLine of block.split("\n")) {
+    const line = rawLine.trimEnd();
+    if (!line || line.startsWith(":")) continue;
+    const separator = line.indexOf(":");
+    const field = separator >= 0 ? line.slice(0, separator) : line;
+    let value = separator >= 0 ? line.slice(separator + 1) : "";
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") event = value;
+    if (field === "data") data.push(value);
+  }
+  return { event, data: data.join("\n") };
+}
+
+export async function answerQuestionStream(
+  payload: AnswerQuestionPayload,
+  handlers: StreamHandlers = {}
+) {
+  const response = await fetch(`${API_BASE}/embedding/rag/answer/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders()
+    },
+    body: JSON.stringify(payload)
+  });
+  if (!response.ok) throw new Error(await parseError(response));
+  if (!response.body) return answerQuestion(payload);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalResponse: AnswerResponse | null = null;
+
+  const consume = (block: string) => {
+    const packet = parseSseBlock(block);
+    if (!packet.data) return;
+    const data = JSON.parse(packet.data);
+    if (packet.event === "token") {
+      handlers.onToken?.(String(data.delta ?? ""));
+      return;
+    }
+    if (packet.event === "final") {
+      finalResponse = data as AnswerResponse;
+      handlers.onFinal?.(finalResponse);
+      return;
+    }
+    if (packet.event === "error") {
+      throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data));
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+    let separator = buffer.indexOf("\n\n");
+    while (separator >= 0) {
+      consume(buffer.slice(0, separator));
+      buffer = buffer.slice(separator + 2);
+      separator = buffer.indexOf("\n\n");
+    }
+  }
+
+  buffer += decoder.decode().replace(/\r\n/g, "\n");
+  if (buffer.trim()) consume(buffer);
+  if (!finalResponse) throw new Error("Stream ended before the final answer was received.");
+  return finalResponse;
 }
 
 export function createAgentTask(payload: {
