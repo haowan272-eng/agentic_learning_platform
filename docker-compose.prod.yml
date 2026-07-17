@@ -4,11 +4,11 @@ x-backend-env: &backend-env
   APP_ENV: production
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
   LOG_JSON: ${LOG_JSON:-true}
-  DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-interview_user}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-interview_improvement_rag}}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-interview_user}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-interview_improvement_rag}
   REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
   CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/1
   CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/2
-  QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+  QDRANT_URL: http://qdrant:6333
   QDRANT_API_KEY: ${QDRANT_API_KEY:-}
   QDRANT_PREFER_GRPC: ${QDRANT_PREFER_GRPC:-false}
   QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME:-interview_improvement_chunks}

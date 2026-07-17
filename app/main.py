@@ -27,7 +27,7 @@ from .db_migration import upgrade_database
 setup_logging()
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="RAG Knowledge Platform", version="1.0.0")
+app = FastAPI(title="Interview Improvement Learning Platform", version="1.0.0")
 
 
 def _validate_production_secret(name: str, value: str) -> None:

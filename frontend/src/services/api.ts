@@ -77,9 +77,9 @@ export type AgentEvent = {
 };
 
 const API_BASE = import.meta.env.VITE_API_BASE?.replace(/\/$/, "") ?? "";
-const ACCESS_KEY = "interview_lift_access";
-const REFRESH_KEY = "interview_lift_refresh";
-const USER_KEY = "interview_lift_user";
+const ACCESS_KEY = "interview_improvement_rag_access";
+const REFRESH_KEY = "interview_improvement_rag_refresh";
+const USER_KEY = "interview_improvement_rag_user";
 
 export const tokenStore = {
   access: () => localStorage.getItem(ACCESS_KEY) ?? "",
@@ -221,4 +221,3 @@ export function listAgentEvents(taskId: string, afterIndex = 0) {
 export function cancelAgentTask(taskId: string) {
   return requestJson<AgentTask>(`/agent/tasks/${taskId}/cancel`, { method: "POST" });
 }
-
