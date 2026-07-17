@@ -5,9 +5,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Annotated, Literal, Protocol, TypedDict
 
+from pydantic import BaseModel, ConfigDict, Field
+
 
 TaskStatus = Literal["pending", "running", "waiting_user", "completed", "failed", "cancelled"]
 NextAction = Literal["dispatch", "repair", "replan", "ask_user", "fallback", "complete"]
+PlanRoute = Literal["approval_gate", "dispatch_research"]
+VerificationRoute = Literal["final_response", "repair_plan", "approval_gate", "fallback_response"]
 
 
 class Artifact(TypedDict, total=False):
@@ -90,6 +94,7 @@ class AgentTaskState(TypedDict, total=False):
 
 
 class ResearchWorkItem(TypedDict, total=False):
+    session_id: str
     task_id: str
     run_id: str
     username: str
@@ -143,6 +148,183 @@ class AgentEvent(TypedDict, total=False):
     message: str
     payload: dict[str, Any]
     created_at: datetime
+
+
+class RuntimeModel(BaseModel):
+    """Strict formatting boundary for runtime payloads.
+
+    LangGraph still consumes TypedDict state above so reducers such as
+    `operator.add` work correctly.  These Pydantic models validate and format
+    state as it enters and leaves each node.
+    """
+
+    model_config = ConfigDict(extra="allow", validate_assignment=True)
+
+
+class ArtifactModel(RuntimeModel):
+    artifact_id: str = Field(..., min_length=1, max_length=128)
+    kind: str = Field(..., min_length=1, max_length=64)
+    producer: str = Field(..., min_length=1, max_length=64)
+    correlation_id: str = Field(..., min_length=1, max_length=128)
+    data: dict[str, Any] = Field(default_factory=dict)
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    error: dict[str, Any] | None = None
+
+
+class AgentMessageModel(RuntimeModel):
+    message_id: str = Field(..., min_length=1, max_length=128)
+    from_agent: str = Field(..., min_length=1, max_length=64)
+    to_agent: str = Field(..., min_length=1, max_length=64)
+    kind: Literal["delegate", "result", "repair_request", "replan_request", "approval_request"]
+    correlation_id: str = Field(..., min_length=1, max_length=128)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentErrorModel(RuntimeModel):
+    source: str = Field(..., min_length=1, max_length=64)
+    error_type: str = Field(..., min_length=1, max_length=128)
+    message: str = Field(..., min_length=1, max_length=2000)
+    retryable: bool = True
+    correlation_id: str | None = Field(default=None, max_length=128)
+
+
+class AgentEventModel(RuntimeModel):
+    session_id: str = Field(..., min_length=1, max_length=128)
+    task_id: str = Field(..., min_length=1, max_length=128)
+    run_id: str | None = Field(default=None, max_length=128)
+    event_type: str = Field(..., min_length=1, max_length=128)
+    event_index: int | None = Field(default=None, ge=1)
+    agent_name: str | None = Field(default=None, max_length=64)
+    skill_name: str | None = Field(default=None, max_length=64)
+    tool_name: str | None = Field(default=None, max_length=128)
+    step_id: str | None = Field(default=None, max_length=128)
+    message: str = Field(..., min_length=1, max_length=4000)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class RuntimeBudgetModel(RuntimeModel):
+    deadline_seconds: int = Field(default=900, le=86400)
+    max_steps: int = Field(default=8, ge=1, le=64)
+    max_tool_calls: int = Field(default=12, ge=0, le=256)
+    max_total_tokens: int = Field(default=24000, ge=1000, le=2_000_000)
+    max_cost_usd: float = Field(default=2.0, ge=0.0, le=1000.0)
+    started_at: str | None = None
+
+
+class AgentTaskStateModel(RuntimeModel):
+    session_id: str = Field(..., min_length=1, max_length=128)
+    task_id: str = Field(..., min_length=1, max_length=128)
+    run_id: str = Field(..., min_length=1, max_length=128)
+    user_id: int | None = Field(default=None, ge=1)
+    username: str = Field(..., min_length=1, max_length=128)
+    user_input: str = Field(..., min_length=1, max_length=8000)
+    task_type: str = Field(default="interview_improvement", min_length=1, max_length=128)
+    budget: RuntimeBudgetModel = Field(default_factory=RuntimeBudgetModel)
+    token_usage: int = Field(default=0, ge=0)
+    estimated_cost_usd: float = Field(default=0.0, ge=0.0)
+    status: TaskStatus = "pending"
+    goal: str | None = Field(default=None, max_length=8000)
+    intent: str | None = Field(default=None, max_length=128)
+    kb_id: int | None = Field(default=None, ge=1)
+    document_id: int | None = Field(default=None, ge=1)
+    conversation_id: int | None = Field(default=None, ge=1)
+    memory_context: dict[str, Any] = Field(default_factory=dict)
+    plan: dict[str, Any] = Field(default_factory=dict)
+    planning_source: str | None = Field(default=None, max_length=128)
+    planner_error: str | None = Field(default=None, max_length=4000)
+    repair_count: int = Field(default=0, ge=0, le=16)
+    approval: dict[str, Any] | None = None
+    next_action: NextAction | None = None
+    proposal: dict[str, Any] = Field(default_factory=dict)
+    verification: dict[str, Any] = Field(default_factory=dict)
+    final_answer: str | None = Field(default=None, max_length=64000)
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    grounding: dict[str, Any] = Field(default_factory=dict)
+    artifacts: list[ArtifactModel] = Field(default_factory=list)
+    messages: list[AgentMessageModel] = Field(default_factory=list)
+    errors: list[AgentErrorModel] = Field(default_factory=list)
+    emitted_events: list[AgentEventModel] = Field(default_factory=list)
+    memory_updates: list[dict[str, Any]] = Field(default_factory=list)
+    session_summary: dict[str, Any] | None = None
+
+
+class ResearchWorkItemModel(RuntimeModel):
+    session_id: str = Field(..., min_length=1, max_length=128)
+    task_id: str = Field(..., min_length=1, max_length=128)
+    run_id: str = Field(..., min_length=1, max_length=128)
+    username: str = Field(..., min_length=1, max_length=128)
+    user_id: int | None = Field(default=None, ge=1)
+    kb_id: int | None = Field(default=None, ge=1)
+    document_id: int | None = Field(default=None, ge=1)
+    conversation_id: int | None = Field(default=None, ge=1)
+    correlation_id: str = Field(..., min_length=1, max_length=128)
+    query: str = Field(..., min_length=1, max_length=2000)
+    objective: str = Field(..., min_length=1, max_length=1000)
+    top_k: int = Field(default=5, ge=1, le=20)
+    repair_reason: str | None = Field(default=None, max_length=1000)
+    budget: RuntimeBudgetModel = Field(default_factory=RuntimeBudgetModel)
+
+
+class NodeUpdateModel(RuntimeModel):
+    status: TaskStatus | None = None
+    user_input: str | None = Field(default=None, min_length=1, max_length=8000)
+    memory_context: dict[str, Any] | None = None
+    plan: dict[str, Any] | None = None
+    goal: str | None = Field(default=None, max_length=8000)
+    intent: str | None = Field(default=None, max_length=128)
+    planning_source: str | None = Field(default=None, max_length=128)
+    planner_error: str | None = Field(default=None, max_length=4000)
+    repair_count: int | None = Field(default=None, ge=0, le=16)
+    approval: dict[str, Any] | None = None
+    proposal: dict[str, Any] | None = None
+    verification: dict[str, Any] | None = None
+    final_answer: str | None = Field(default=None, max_length=64000)
+    citations: list[dict[str, Any]] | None = None
+    grounding: dict[str, Any] | None = None
+    artifacts: list[ArtifactModel] | None = None
+    messages: list[AgentMessageModel] | None = None
+    errors: list[AgentErrorModel] | None = None
+    emitted_events: list[AgentEventModel] | None = None
+    memory_updates: list[dict[str, Any]] | None = None
+    session_summary: dict[str, Any] | None = None
+
+
+class PlanRouteModel(RuntimeModel):
+    route: PlanRoute
+
+
+class VerificationRouteModel(RuntimeModel):
+    route: VerificationRoute
+
+
+def _dump_model(model: BaseModel) -> dict[str, Any]:
+    return model.model_dump(mode="python", exclude_none=True)
+
+
+def validate_agent_state(state: dict[str, Any]) -> dict[str, Any]:
+    return _dump_model(AgentTaskStateModel.model_validate(state))
+
+
+def validate_research_work_item(work: dict[str, Any]) -> dict[str, Any]:
+    return _dump_model(ResearchWorkItemModel.model_validate(work))
+
+
+def validate_node_update(update: dict[str, Any]) -> dict[str, Any]:
+    return _dump_model(NodeUpdateModel.model_validate(update))
+
+
+def validate_agent_event(event: dict[str, Any]) -> dict[str, Any]:
+    return _dump_model(AgentEventModel.model_validate(event))
+
+
+def validate_plan_route(route: str) -> PlanRoute:
+    return PlanRouteModel(route=route).route
+
+
+def validate_verification_route(route: str) -> VerificationRoute:
+    return VerificationRouteModel(route=route).route
 
 
 class RuntimeStore(Protocol):

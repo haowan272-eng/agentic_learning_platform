@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from app.agent_runtime.planner import (
     AgentPlan,
@@ -36,6 +37,10 @@ from app.agent_runtime.schemas import (
     Artifact,
     RuntimeStore,
     ToolResult,
+    validate_agent_state,
+    validate_node_update,
+    validate_research_work_item,
+    validate_verification_route,
 )
 from app.agent_runtime.tools import call_tool
 
@@ -606,6 +611,64 @@ class TestStateRoundTrip:
 
 class TestAgentTaskStateInvariants:
     """Verify that the state shape accepted by the graph meets minimum requirements."""
+
+    def test_pydantic_state_boundary_rejects_invalid_status(self):
+        state = _make_base_state(status="unknown")
+
+        with pytest.raises(ValidationError):
+            validate_agent_state(state)
+
+    def test_pydantic_node_update_formats_nested_runtime_payloads(self):
+        update = validate_node_update(
+            {
+                "status": "running",
+                "artifacts": [
+                    {
+                        "artifact_id": "a1",
+                        "kind": "research",
+                        "producer": "research_agent",
+                        "correlation_id": "c1",
+                        "data": {"answer": "ok"},
+                        "citations": [],
+                        "confidence": 0.5,
+                        "error": None,
+                    }
+                ],
+                "emitted_events": [
+                    {
+                        "session_id": "sess-test",
+                        "task_id": "task-test",
+                        "run_id": "run-test",
+                        "event_type": "agent.completed",
+                        "event_index": 1,
+                        "agent_name": "research_agent",
+                        "message": "Research Agent finished.",
+                        "payload": {"ok": True},
+                        "created_at": "2026-01-01T00:00:00+00:00",
+                    }
+                ],
+            }
+        )
+
+        assert update["artifacts"][0]["confidence"] == 0.5
+        assert update["emitted_events"][0]["created_at"].isoformat() == "2026-01-01T00:00:00+00:00"
+
+    def test_pydantic_research_work_item_requires_correlation_id(self):
+        work = {
+            "session_id": "sess-test",
+            "task_id": "task-test",
+            "run_id": "run-test",
+            "username": "tester",
+            "query": "test query",
+            "objective": "test objective",
+        }
+
+        with pytest.raises(ValidationError):
+            validate_research_work_item(work)
+
+    def test_pydantic_route_boundary_rejects_unknown_verifier_route(self):
+        with pytest.raises(ValidationError):
+            validate_verification_route("skip_final")
 
     def test_minimal_state_is_accepted_by_graph_builder(self):
         from langgraph.checkpoint.memory import MemorySaver

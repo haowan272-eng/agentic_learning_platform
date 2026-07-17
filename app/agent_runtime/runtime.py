@@ -12,7 +12,20 @@ from app.memory.short_term import append_recent_event
 from app.observability import increment, observe_ms
 
 from .planner import AgentPlan, ResearchTask, generate_plan, generate_proposal, verify_proposal
-from .schemas import AgentError, AgentEvent, AgentMessage, AgentTaskState, Artifact, ResearchWorkItem, RuntimeStore
+from .schemas import (
+    AgentEvent,
+    AgentMessage,
+    AgentTaskState,
+    Artifact,
+    ResearchWorkItem,
+    RuntimeStore,
+    validate_agent_event,
+    validate_agent_state,
+    validate_node_update,
+    validate_plan_route,
+    validate_research_work_item,
+    validate_verification_route,
+)
 from .tools import call_tool
 from .feedback import FailureSignal, get_feedback_summary_for_prompt, record_verification_failure
 
@@ -43,7 +56,7 @@ class AgentBudgetExceeded(RuntimeError):
 
 
 def _event(state: dict[str, Any], store: RuntimeStore, event_type: str, message: str, *, agent_name: str, payload: dict[str, Any] | None = None, tool_name: str | None = None, step_id: str | None = None) -> AgentEvent:
-    event: AgentEvent = {
+    event: AgentEvent = validate_agent_event({
         "session_id": state["session_id"],
         "task_id": state["task_id"],
         "run_id": state.get("run_id"),
@@ -54,10 +67,11 @@ def _event(state: dict[str, Any], store: RuntimeStore, event_type: str, message:
         "message": message,
         "payload": payload or {},
         "created_at": datetime.now(timezone.utc),
-    }
+    })
     event_index = store.append_event(event)
     if event_index is not None:
         event["event_index"] = int(event_index)
+        event = validate_agent_event(event)
     append_recent_event(state.get("user_id"), state.get("session_id"), event)
     publish_task_event(event)
     increment("agent_events_total", {"event_type": event_type, "agent": agent_name})
@@ -109,6 +123,7 @@ def _enforce_policy(state: dict[str, Any], store: RuntimeStore) -> None:
 
 
 def _supervisor_plan(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
     try:
         memory_context = build_context_for_state({key: state.get(key) for key in ("user_id", "session_id", "task_id", "run_id")})
         memory_event = _event(state, store, "memory.loaded", "Memory Agent loaded scoped profile and session context.", agent_name="memory_agent")
@@ -137,14 +152,17 @@ def _supervisor_plan(state: AgentTaskState, store: RuntimeStore) -> dict[str, An
     plan_payload = plan.model_dump(mode="json")
     store.save_plan({"task_id": state["task_id"], "run_id": state["run_id"], "plan_version": int(state.get("repair_count") or 0) + 1, "source": source, "status": "awaiting_approval" if plan.approval_required else "active", "goal": plan.goal, "intent": plan.intent, "steps": plan_payload.get("research_tasks", []), "error_message": error})
     plan_event = _event(state, store, "plan.created", "Supervisor created a parallel multi-agent plan.", agent_name="supervisor", payload={"source": source, "plan": plan_payload, "error": error})
-    return {"memory_context": memory_context, "plan": plan_payload, "goal": plan.goal, "intent": plan.intent, "planning_source": source, "planner_error": error, "status": status, "artifacts": [memory_artifact], "emitted_events": [memory_event, plan_event]}
+    return validate_node_update({"memory_context": memory_context, "plan": plan_payload, "goal": plan.goal, "intent": plan.intent, "planning_source": source, "planner_error": error, "status": status, "artifacts": [memory_artifact], "emitted_events": [memory_event, plan_event]})
 
 
 def _plan_route(state: AgentTaskState) -> str:
-    return "approval_gate" if (state.get("plan") or {}).get("approval_required") else "dispatch_research"
+    state = validate_agent_state(state)
+    route = "approval_gate" if (state.get("plan") or {}).get("approval_required") else "dispatch_research"
+    return validate_plan_route(route)
 
 
 def _approval_gate(state: AgentTaskState, store: RuntimeStore) -> Any:
+    state = validate_agent_state(state)
     if interrupt is None or Command is None:
         raise RuntimeError("LangGraph interrupt support is required for approval gates.")
     request = {"task_id": state["task_id"], "reason": (state.get("plan") or {}).get("approval_reason") or "Review the Supervisor plan before execution.", "plan": state.get("plan"), "allowed_actions": ["approve", "edit", "reject"]}
@@ -153,28 +171,51 @@ def _approval_gate(state: AgentTaskState, store: RuntimeStore) -> Any:
     event = _event(state, store, "approval.resolved", f"User approval action: {action}.", agent_name="human_gate", payload={"decision": decision})
     if action == "edit":
         edited_input = str((decision or {}).get("user_input") or state["user_input"])
-        return Command(update={"user_input": edited_input, "approval": {"decision": decision}, "status": "running", "emitted_events": [event]}, goto="supervisor_plan")
+        return Command(update=validate_node_update({"user_input": edited_input, "approval": {"decision": decision}, "status": "running", "emitted_events": [event]}), goto="supervisor_plan")
     if action == "approve":
-        return Command(update={"approval": {"decision": decision}, "status": "running", "emitted_events": [event]}, goto="dispatch_research")
-    return Command(update={"approval": {"decision": decision}, "status": "running", "emitted_events": [event]}, goto="fallback_response")
+        return Command(update=validate_node_update({"approval": {"decision": decision}, "status": "running", "emitted_events": [event]}), goto="dispatch_research")
+    return Command(update=validate_node_update({"approval": {"decision": decision}, "status": "running", "emitted_events": [event]}), goto="fallback_response")
 
 
 def _dispatch_research(state: AgentTaskState) -> list[Any]:
+    state = validate_agent_state(state)
     if Send is None:
         raise RuntimeError("LangGraph Send support is required for parallel research.")
     tasks = (state.get("plan") or {}).get("research_tasks") or []
     return [
-        Send("research_agent", {
+        Send("research_agent", validate_research_work_item({
             "session_id": state["session_id"], "task_id": state["task_id"], "run_id": state["run_id"], "username": state["username"], "user_id": state.get("user_id"),
             "kb_id": state.get("kb_id"), "document_id": state.get("document_id"), "conversation_id": state.get("conversation_id"),
             "correlation_id": item["task_id"], "query": item["query"], "objective": item["objective"], "top_k": item.get("top_k", 5),
-        })
+            "budget": state.get("budget") or {},
+        }))
         for item in tasks
     ]
 
 
 def _research_agent(work: ResearchWorkItem, store: RuntimeStore) -> dict[str, Any]:
-    _enforce_policy(work, store)
+    work = validate_research_work_item(work)
+    try:
+        _enforce_policy(work, store)
+    except AgentBudgetExceeded as exc:
+        event = _event(work, store, "agent.failed", str(exc), agent_name="research_agent", step_id=work["correlation_id"], payload={"error_type": "budget_exceeded"})
+        artifact: Artifact = {
+            "artifact_id": f"research-{uuid4().hex[:12]}",
+            "kind": "research",
+            "producer": "research_agent",
+            "correlation_id": work["correlation_id"],
+            "data": {},
+            "citations": [],
+            "confidence": 0.0,
+            "error": {"type": "budget_exceeded", "message": str(exc), "retryable": False},
+        }
+        message: AgentMessage = {"message_id": str(uuid4()), "from_agent": "research_agent", "to_agent": "architect_agent", "kind": "result", "correlation_id": work["correlation_id"], "payload": {"artifact_id": artifact["artifact_id"], "error": artifact["error"]}}
+        return validate_node_update({
+            "artifacts": [artifact],
+            "messages": [message],
+            "errors": [{"source": "research_agent", "error_type": "budget_exceeded", "message": str(exc), "retryable": False, "correlation_id": work["correlation_id"]}],
+            "emitted_events": [event],
+        })
     start = _event(work, store, "agent.started", work["objective"], agent_name="research_agent", payload={"correlation_id": work["correlation_id"]})
     result = call_tool(
         "knowledge.answer",
@@ -196,17 +237,19 @@ def _research_agent(work: ResearchWorkItem, store: RuntimeStore) -> dict[str, An
     updates: dict[str, Any] = {"artifacts": [artifact], "messages": [message], "emitted_events": [start, done]}
     if result.get("error"):
         updates["errors"] = [{"source": "research_agent", "error_type": (result.get("error") or {}).get("type", "research_failed"), "message": (result.get("error") or {}).get("message", "Research failed."), "retryable": bool((result.get("error") or {}).get("retryable", True)), "correlation_id": work["correlation_id"]}]
-    return updates
+    return validate_node_update(updates)
 
 
 def _architect_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
     proposal, error, source = generate_proposal(state, on_token=_llm_token_callback(state, "architect_agent"))
     artifact: Artifact = {"artifact_id": f"proposal-{uuid4().hex[:12]}", "kind": "proposal", "producer": "architect_agent", "correlation_id": "proposal", "data": proposal.model_dump(mode="json"), "citations": [citation for item in state.get("artifacts", []) for citation in item.get("citations", [])], "confidence": 0.8 if error is None else 0.45, "error": {"type": "architect_degraded", "message": error} if error else None}
     event = _event(state, store, "agent.completed", "Architect Agent generated a structured proposal.", agent_name="architect_agent", payload={"artifact_id": artifact["artifact_id"], "degraded": bool(error), "model_source": source})
-    return {"proposal": artifact["data"], "artifacts": [artifact], "emitted_events": [event]}
+    return validate_node_update({"proposal": artifact["data"], "artifacts": [artifact], "emitted_events": [event]})
 
 
 def _verifier_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
     decision, error, source = verify_proposal(state, on_token=_llm_token_callback(state, "verifier_agent"))
     verification = decision.model_dump(mode="json")
     verification["error"] = error
@@ -217,45 +260,51 @@ def _verifier_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any
     if decision.status != "passed":
         all_citations = [c for a in state.get("artifacts", []) for c in a.get("citations", [])]
         for issue in decision.issues:
-            record_verification_failure(
-                FailureSignal(
-                    task_id=state["task_id"],
-                    run_id=state.get("run_id"),
-                    failure_type=str(issue.get("type", "other")),
-                    message=str(issue.get("message", "")),
-                    repair_strategy_used="rewrite_query" if decision.status == "repair" else None,
-                    kb_id=state.get("kb_id"),
-                    query_snippet=str(state.get("user_input", ""))[:200],
-                    top_k_used=state.get("budget", {}).get("top_k", 5),
-                    source_count=len({c.get("document_id") or c.get("source") for c in all_citations}),
-                    citation_count=len(all_citations),
-                    confidence=decision.score,
+            try:
+                record_verification_failure(
+                    FailureSignal(
+                        task_id=state["task_id"],
+                        run_id=state.get("run_id"),
+                        failure_type=str(issue.get("type", "other")),
+                        message=str(issue.get("message", "")),
+                        repair_strategy_used="rewrite_query" if decision.status == "repair" else None,
+                        kb_id=state.get("kb_id"),
+                        query_snippet=str(state.get("user_input", ""))[:200],
+                        top_k_used=state.get("budget", {}).get("top_k", 5),
+                        source_count=len({c.get("document_id") or c.get("source") for c in all_citations}),
+                        citation_count=len(all_citations),
+                        confidence=decision.score,
+                    )
                 )
-            )
+            except Exception:  # noqa: BLE001
+                continue
 
-    return {"verification": verification, "emitted_events": [event]}
+    return validate_node_update({"verification": verification, "emitted_events": [event]})
 
 
 def _verification_route(state: AgentTaskState) -> str:
+    state = validate_agent_state(state)
     status = (state.get("verification") or {}).get("status")
     if status == "passed":
-        return "final_response"
+        return validate_verification_route("final_response")
     if status == "needs_approval":
-        return "approval_gate"
+        return validate_verification_route("approval_gate")
     if status == "repair" and int(state.get("repair_count") or 0) < MAX_REPAIR_COUNT:
-        return "repair_plan"
-    return "fallback_response"
+        return validate_verification_route("repair_plan")
+    return validate_verification_route("fallback_response")
 
 
 def _repair_plan(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
     current = state.get("verification") or {}
     queries = current.get("repair_queries") or [state.get("user_input", "")]
     tasks = [ResearchTask(task_id=f"repair-{index + 1}-{uuid4().hex[:6]}", query=str(query), objective="补充 Verifier 指出的缺失证据。", top_k=8).model_dump(mode="json") for index, query in enumerate(queries[:3]) if str(query).strip()]
     event = _event(state, store, "repair.started", "Supervisor dispatched targeted evidence repair.", agent_name="supervisor", payload={"queries": queries})
-    return {"repair_count": int(state.get("repair_count") or 0) + 1, "plan": {**(state.get("plan") or {}), "research_tasks": tasks}, "emitted_events": [event]}
+    return validate_node_update({"repair_count": int(state.get("repair_count") or 0) + 1, "plan": {**(state.get("plan") or {}), "research_tasks": tasks}, "emitted_events": [event]})
 
 
 def _final_response(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
     proposal = state.get("proposal") or {}
     sections = proposal.get("sections") or []
     lines = [f"# {proposal.get('title', '项目改造方案')}", "", proposal.get("summary", "")]
@@ -270,13 +319,14 @@ def _final_response(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any
     except Exception:  # noqa: BLE001
         memory_updates, session_summary = [], None
     event = _event(state, store, "task.completed", "Multi-agent task completed.", agent_name="runtime", payload={"citation_count": len(citations)})
-    return {"status": "completed", "final_answer": final_answer, "citations": citations, "grounding": {"mode": "rag_grounded" if citations else "general", "rag_used": bool(citations)}, "memory_updates": memory_updates, "session_summary": session_summary, "emitted_events": [event]}
+    return validate_node_update({"status": "completed", "final_answer": final_answer, "citations": citations, "grounding": {"mode": "rag_grounded" if citations else "general", "rag_used": bool(citations)}, "memory_updates": memory_updates, "session_summary": session_summary, "emitted_events": [event]})
 
 
 def _fallback_response(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
     final_answer = "当前无法取得足够的可验证证据来完成该方案。请补充或索引相关项目材料后重试。"
     event = _event(state, store, "fallback.used", "Evidence is insufficient; returned safe fallback.", agent_name="runtime", payload={"verification": state.get("verification")})
-    return {"status": "completed", "final_answer": final_answer, "grounding": {"mode": "insufficient_evidence", "rag_used": False}, "emitted_events": [event]}
+    return validate_node_update({"status": "completed", "final_answer": final_answer, "grounding": {"mode": "insufficient_evidence", "rag_used": False}, "emitted_events": [event]})
 
 
 def build_agent_graph(store: RuntimeStore, *, checkpointer: Any) -> Any:
@@ -319,6 +369,7 @@ def postgres_checkpointer() -> Iterator[Any]:
 
 
 def _invoke_graph(initial_state: AgentTaskState, store: RuntimeStore, checkpointer: Any, resume_payload: dict[str, Any] | None) -> AgentTaskState:
+    initial_state = validate_agent_state(initial_state)
     graph = build_agent_graph(store, checkpointer=checkpointer)
     config = {"configurable": {"thread_id": initial_state["task_id"]}}
     if resume_payload is not None:
@@ -330,7 +381,7 @@ def _invoke_graph(initial_state: AgentTaskState, store: RuntimeStore, checkpoint
     # and transient LLM token chunks are published inside nodes immediately.
     for _ in graph.stream(input_value, config=config, stream_mode="updates"):
         pass
-    final_state = dict(graph.get_state(config).values)
+    final_state = validate_agent_state(dict(graph.get_state(config).values))
     store.save_task_state(initial_state["task_id"], final_state)
     return final_state
 
@@ -338,8 +389,9 @@ def _invoke_graph(initial_state: AgentTaskState, store: RuntimeStore, checkpoint
 def run_agent_task(initial_state: AgentTaskState, store: RuntimeStore, *, resume_payload: dict[str, Any] | None = None, checkpointer: Any | None = None) -> AgentTaskState:
     if StateGraph is None:
         raise RuntimeError(f"langgraph is required for Agent Runtime: {LANGGRAPH_IMPORT_ERROR}")
+    initial_state = validate_agent_state(initial_state)
     event = _event(initial_state, store, "task.resumed" if resume_payload else "task.started", "Agent task resumed." if resume_payload else "Agent task started.", agent_name="runtime")
-    initial_state = {**initial_state, "emitted_events": [event]}
+    initial_state = validate_agent_state({**initial_state, "emitted_events": [event]})
     if checkpointer is not None:
         return _invoke_graph(initial_state, store, checkpointer, resume_payload)
     with postgres_checkpointer() as durable_checkpointer:
