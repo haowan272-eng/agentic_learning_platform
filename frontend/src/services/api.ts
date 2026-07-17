@@ -20,8 +20,22 @@ export type DocumentItem = {
   content_type?: string;
   file_size?: number;
   status: string;
+  source_retained?: boolean;
   created_at: string;
   kb_id?: number | null;
+};
+
+export type DocumentProgress = {
+  document_id: number;
+  status: string;
+  document_status?: string;
+  percent: number;
+  task_id?: string | null;
+  attempt?: number | null;
+  total_chunks?: number | null;
+  total_embeddings?: number | null;
+  error_message?: string | null;
+  updated_at?: string | null;
 };
 
 export type Citation = {
@@ -295,6 +309,64 @@ export function listAgentTasks() {
 
 export function listAgentEvents(taskId: string, afterIndex = 0) {
   return requestJson<AgentEvent[]>(`/agent/tasks/${taskId}/events?after_index=${afterIndex}`);
+}
+
+export function getDocumentProgress(documentId: number) {
+  return requestJson<DocumentProgress>(`/document/${documentId}/progress`);
+}
+
+export function reindexDocument(documentId: number) {
+  return requestJson<{ id: number; file_name: string; status: string; task_id: string; kb_id?: number | null }>(
+    `/document/${documentId}/reindex`,
+    { method: "POST" }
+  );
+}
+
+type AgentStreamHandlers = {
+  onEvent?: (event: AgentEvent) => void;
+  onToken?: (delta: string) => void;
+};
+
+export async function streamAgentEvents(
+  taskId: string,
+  afterIndex = 0,
+  handlers: AgentStreamHandlers = {},
+  signal?: AbortSignal
+) {
+  const response = await fetch(`${API_BASE}/agent/tasks/${taskId}/stream?after_index=${afterIndex}`, {
+    headers: authHeaders(),
+    signal
+  });
+  if (!response.ok) throw new Error(await parseError(response));
+  if (!response.body) return;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const consume = (block: string) => {
+    const packet = parseSseBlock(block);
+    if (!packet.data) return;
+    const data = JSON.parse(packet.data);
+    if (packet.event === "llm.token") {
+      handlers.onToken?.(String(data.payload?.text ?? data.text ?? ""));
+      return;
+    }
+    if (typeof data.event_index === "number") handlers.onEvent?.(data as AgentEvent);
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+    let separator = buffer.indexOf("\n\n");
+    while (separator >= 0) {
+      consume(buffer.slice(0, separator));
+      buffer = buffer.slice(separator + 2);
+      separator = buffer.indexOf("\n\n");
+    }
+  }
+  buffer += decoder.decode().replace(/\r\n/g, "\n");
+  if (buffer.trim()) consume(buffer);
 }
 
 export function cancelAgentTask(taskId: string) {

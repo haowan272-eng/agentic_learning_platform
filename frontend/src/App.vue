@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive } from "vue";
 import {
   ArrowRight,
   BookOpenCheck,
@@ -29,18 +29,22 @@ import {
   cancelAgentTask,
   createAgentTask,
   createKnowledgeBase,
+  getDocumentProgress,
   listAgentEvents,
   listAgentTasks,
   listDocuments,
   listKnowledgeBases,
   login,
+  reindexDocument,
   register,
+  streamAgentEvents,
   tokenStore,
   uploadDocument,
   type AnswerQuestionPayload,
   type AgentEvent,
   type AgentTask,
   type AnswerResponse,
+  type DocumentProgress,
   type DocumentItem,
   type KnowledgeBase
 } from "@/services/api";
@@ -92,6 +96,7 @@ const state = reactive({
   token: tokenStore.access(),
   kbs: [] as KnowledgeBase[],
   docs: [] as DocumentItem[],
+  docProgresses: {} as Record<number, DocumentProgress>,
   tasks: [] as AgentTask[],
   events: [] as AgentEvent[],
   selectedKbId: 0,
@@ -108,7 +113,9 @@ const state = reactive({
   selectedMode: modes[0],
   busy: false,
   uploading: false,
+  docBusyId: 0,
   taskBusy: false,
+  agentStreaming: false,
   error: ""
 });
 
@@ -116,11 +123,100 @@ const isAuthed = computed(() => Boolean(state.token));
 const selectedKb = computed(() => state.kbs.find((kb) => kb.id === state.selectedKbId));
 const selectedDoc = computed(() => state.docs.find((doc) => doc.id === state.selectedDocId));
 const activeTask = computed(() => state.tasks[0]);
-const readyDocs = computed(() => state.docs.filter((doc) => doc.status === "indexed" || doc.status === "completed").length);
-const failedDocs = computed(() => state.docs.filter((doc) => doc.status === "failed").length);
+const readyDocs = computed(() => state.docs.filter((doc) => isIndexedStatus(effectiveDocStatus(doc))).length);
+const failedDocs = computed(() => state.docs.filter((doc) => effectiveDocStatus(doc) === "failed").length);
+const selectedDocStatus = computed(() => selectedDoc.value ? effectiveDocStatus(selectedDoc.value) : "");
+const selectedDocCanSearch = computed(() => !selectedDoc.value || isIndexedStatus(selectedDocStatus.value));
+const selectedDocProgress = computed(() => selectedDoc.value ? progressFor(selectedDoc.value) : null);
+let documentProgressTimer: number | undefined;
+let agentStreamAbort: AbortController | null = null;
+let activeAgentStreamTaskId = "";
 
 function messageFromError(error: unknown, fallback: string) {
   return error instanceof Error && error.message ? error.message : fallback;
+}
+
+function isIndexedStatus(status: string) {
+  return status === "indexed" || status === "completed";
+}
+
+function isActiveIndexStatus(status: string) {
+  return ["uploaded", "queued", "waiting_lock", "retrying", "indexing", "parsing", "embedding"].includes(status);
+}
+
+function effectiveDocStatus(doc: DocumentItem) {
+  return state.docProgresses[doc.id]?.status || doc.status;
+}
+
+function progressFor(doc: DocumentItem) {
+  const status = effectiveDocStatus(doc);
+  return state.docProgresses[doc.id] ?? {
+    document_id: doc.id,
+    status,
+    document_status: doc.status,
+    percent: isIndexedStatus(status) ? 100 : status === "failed" ? 100 : 0
+  };
+}
+
+function progressLabel(progress: DocumentProgress) {
+  const labels: Record<string, string> = {
+    uploaded: "等待入队",
+    queued: "队列中",
+    waiting_lock: "等待锁",
+    retrying: "重试中",
+    indexing: "索引中",
+    parsing: "解析文档",
+    embedding: "写入向量",
+    indexed: "已索引",
+    completed: "已完成",
+    failed: "失败"
+  };
+  return labels[progress.status] ?? progress.status;
+}
+
+function upsertAgentEvent(event: AgentEvent) {
+  const index = state.events.findIndex((item) => item.event_index === event.event_index);
+  if (index >= 0) state.events[index] = event;
+  else state.events.push(event);
+  state.events.sort((a, b) => a.event_index - b.event_index);
+}
+
+function stopAgentStream() {
+  agentStreamAbort?.abort();
+  agentStreamAbort = null;
+  activeAgentStreamTaskId = "";
+  state.agentStreaming = false;
+}
+
+function isActiveAgentStatus(status: string) {
+  return ["pending", "running", "waiting_user"].includes(status);
+}
+
+function connectAgentStream(taskId: string) {
+  if (activeAgentStreamTaskId === taskId && agentStreamAbort) return;
+  stopAgentStream();
+  const controller = new AbortController();
+  agentStreamAbort = controller;
+  activeAgentStreamTaskId = taskId;
+  state.agentStreaming = true;
+  const afterIndex = Math.max(0, ...state.events.map((event) => event.event_index));
+  void streamAgentEvents(taskId, afterIndex, {
+    onEvent(event) {
+      upsertAgentEvent(event);
+    }
+  }, controller.signal)
+    .catch((error) => {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      state.error = messageFromError(error, "Agent 事件流连接失败。");
+    })
+    .finally(async () => {
+      if (activeAgentStreamTaskId === taskId) {
+        agentStreamAbort = null;
+        activeAgentStreamTaskId = "";
+        state.agentStreaming = false;
+        await refreshTasks();
+      }
+    });
 }
 
 function wait(ms: number) {
@@ -199,10 +295,16 @@ async function submitAuth() {
 }
 
 function logout() {
+  stopAgentStream();
+  if (documentProgressTimer !== undefined) {
+    window.clearInterval(documentProgressTimer);
+    documentProgressTimer = undefined;
+  }
   tokenStore.clear();
   state.token = "";
   state.kbs = [];
   state.docs = [];
+  state.docProgresses = {};
   state.tasks = [];
   state.events = [];
   state.answer = null;
@@ -222,6 +324,40 @@ async function refreshKbs() {
 async function refreshDocs() {
   state.docs = await listDocuments(state.selectedKbId || undefined);
   if (state.selectedDocId && !state.docs.some((doc) => doc.id === state.selectedDocId)) state.selectedDocId = 0;
+  await refreshDocumentProgresses();
+  updateDocumentProgressPolling();
+}
+
+async function refreshDocumentProgresses() {
+  const targets = state.docs.filter((doc) => {
+    const status = effectiveDocStatus(doc);
+    return isActiveIndexStatus(status) || status === "failed" || state.docProgresses[doc.id];
+  });
+  await Promise.all(targets.map(async (doc) => {
+    try {
+      state.docProgresses[doc.id] = await getDocumentProgress(doc.id);
+    } catch {
+      delete state.docProgresses[doc.id];
+    }
+  }));
+}
+
+function updateDocumentProgressPolling() {
+  const hasActive = state.docs.some((doc) => isActiveIndexStatus(effectiveDocStatus(doc)));
+  if (hasActive && documentProgressTimer === undefined) {
+    documentProgressTimer = window.setInterval(async () => {
+      await refreshDocumentProgresses();
+      if (!state.docs.some((doc) => isActiveIndexStatus(effectiveDocStatus(doc)))) {
+        window.clearInterval(documentProgressTimer);
+        documentProgressTimer = undefined;
+        await refreshDocs();
+      }
+    }, 1600);
+  }
+  if (!hasActive && documentProgressTimer !== undefined) {
+    window.clearInterval(documentProgressTimer);
+    documentProgressTimer = undefined;
+  }
 }
 
 async function addKb() {
@@ -246,8 +382,12 @@ async function onUpload(event: Event) {
   state.uploading = true;
   state.error = "";
   try {
-    await uploadDocument(file, state.selectedKbId || undefined);
+    const uploaded = await uploadDocument(file, state.selectedKbId || undefined);
     await refreshDocs();
+    if (uploaded?.id) {
+      state.docProgresses[uploaded.id] = await getDocumentProgress(uploaded.id);
+      updateDocumentProgressPolling();
+    }
   } catch (error) {
     state.error = messageFromError(error, "上传失败。");
   } finally {
@@ -261,8 +401,27 @@ function selectMode(mode: Mode) {
   state.query = `${mode.prompt}\n\n`;
 }
 
+async function retryDocumentIndex(doc: DocumentItem) {
+  state.docBusyId = doc.id;
+  state.error = "";
+  try {
+    await reindexDocument(doc.id);
+    state.docProgresses[doc.id] = await getDocumentProgress(doc.id);
+    await refreshDocs();
+    updateDocumentProgressPolling();
+  } catch (error) {
+    state.error = messageFromError(error, "重建索引失败。");
+  } finally {
+    state.docBusyId = 0;
+  }
+}
+
 async function askRag() {
   if (!state.query.trim()) return;
+  if (!selectedDocCanSearch.value) {
+    state.error = `文档「${selectedDoc.value?.file_name ?? ""}」当前状态为 ${selectedDocProgress.value ? progressLabel(selectedDocProgress.value) : "不可用"}，完成索引后才能检索。`;
+    return;
+  }
   state.busy = true;
   state.error = "";
   const payload: AnswerQuestionPayload = {
@@ -323,6 +482,7 @@ async function startAgentReview() {
     });
     await refreshTasks();
     await refreshEvents(task.task_id);
+    connectAgentStream(task.task_id);
   } catch (error) {
     state.error = messageFromError(error, "Agent 任务创建失败。");
   } finally {
@@ -332,7 +492,10 @@ async function startAgentReview() {
 
 async function refreshTasks() {
   state.tasks = (await listAgentTasks()).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-  if (state.tasks[0]) await refreshEvents(state.tasks[0].task_id);
+  if (state.tasks[0]) {
+    await refreshEvents(state.tasks[0].task_id);
+    if (isActiveAgentStatus(state.tasks[0].status)) connectAgentStream(state.tasks[0].task_id);
+  }
 }
 
 async function refreshEvents(taskId?: string) {
@@ -345,6 +508,7 @@ async function cancelActiveTask() {
   state.taskBusy = true;
   try {
     await cancelAgentTask(activeTask.value.task_id);
+    stopAgentStream();
     await refreshTasks();
   } catch (error) {
     state.error = messageFromError(error, "取消任务失败。");
@@ -357,6 +521,11 @@ onMounted(() => {
   if (state.token) void bootstrap().catch((error) => {
     state.error = messageFromError(error, "初始化失败。");
   });
+});
+
+onUnmounted(() => {
+  if (documentProgressTimer !== undefined) window.clearInterval(documentProgressTimer);
+  stopAgentStream();
 });
 </script>
 
@@ -459,12 +628,31 @@ onMounted(() => {
               </label>
               <select v-model.number="state.selectedDocId" class="select-field">
                 <option :value="0">全部文档</option>
-                <option v-for="doc in state.docs" :key="doc.id" :value="doc.id">{{ doc.file_name }}</option>
+                <option
+                  v-for="doc in state.docs"
+                  :key="doc.id"
+                  :value="doc.id"
+                  :disabled="!isIndexedStatus(effectiveDocStatus(doc))"
+                >{{ doc.file_name }} · {{ progressLabel(progressFor(doc)) }}</option>
               </select>
               <div class="doc-list">
                 <article v-for="doc in state.docs.slice(0, 6)" :key="doc.id">
                   <FileUp :size="15" />
-                  <span><strong>{{ doc.file_name }}</strong><small>{{ doc.status }}</small></span>
+                  <span>
+                    <strong>{{ doc.file_name }}</strong>
+                    <small>{{ progressLabel(progressFor(doc)) }}</small>
+                    <b class="doc-progress" :class="{ failed: effectiveDocStatus(doc) === 'failed' }">
+                      <i :style="{ width: `${progressFor(doc).percent}%` }"></i>
+                    </b>
+                    <em v-if="progressFor(doc).total_chunks">{{ progressFor(doc).total_chunks }} chunks</em>
+                    <button
+                      v-if="effectiveDocStatus(doc) === 'failed'"
+                      type="button"
+                      class="mini-action"
+                      :disabled="state.docBusyId === doc.id || !doc.source_retained"
+                      @click="retryDocumentIndex(doc)"
+                    >重建索引</button>
+                  </span>
                 </article>
               </div>
             </section>
@@ -519,11 +707,12 @@ onMounted(() => {
                 <label class="toggle"><input v-model="state.rewriteQuery" type="checkbox" />改写问题</label>
               </div>
               <div class="panel-actions">
-                <button class="primary-button" :disabled="state.busy" @click="askRag">
+                <button class="primary-button" :disabled="state.busy || !selectedDocCanSearch" @click="askRag">
                   <LoaderCircle v-if="state.busy" :size="16" class="spin" /><MessageSquareText v-else :size="16" />
                   {{ state.busy ? "生成中" : "生成面试回答" }}
                 </button>
               </div>
+              <p v-if="!selectedDocCanSearch && selectedDocProgress" class="query-hint">当前文档状态为 {{ progressLabel(selectedDocProgress) }}，索引完成后才能按该文档检索。</p>
             </section>
 
             <section v-if="!state.answer" class="workspace-empty">
@@ -560,7 +749,7 @@ onMounted(() => {
         <aside id="agent" class="activity-panel">
           <div class="activity-head">
             <div><p class="eyebrow">AGENT RUNTIME</p><h2>提优事件</h2></div>
-            <span class="live-pill" :class="{ live: activeTask?.status === 'running' }"><i></i>{{ activeTask?.status || "idle" }}</span>
+            <span class="live-pill" :class="{ live: state.agentStreaming || activeTask?.status === 'running' }"><i></i>{{ state.agentStreaming ? "streaming" : activeTask?.status || "idle" }}</span>
           </div>
           <div class="runtime-summary">
             <div><Gauge :size="15" /><span><small>Tasks</small><strong>{{ state.tasks.length }}</strong></span></div>

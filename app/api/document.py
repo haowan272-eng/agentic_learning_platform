@@ -21,7 +21,7 @@ from typing import Optional
 from app.core.database import get_db
 from ..models import User, Document, KnowledgeBaseMember
 from app.api.deps import get_current_user
-from ..queue import enqueue_document_index_task
+from ..queue import enqueue_document_index_task, get_doc_index_progress
 from app.rag.chunker import SUPPORTED_DOCUMENT_EXTENSIONS
 from app.core.config import MAX_DOCUMENT_SIZE_MB, DOCUMENT_UPLOAD_CHUNK_BYTES, UPLOAD_DIR
 
@@ -56,6 +56,43 @@ def _get_user(db: Session, username: str) -> User:
     if not user:
         raise HTTPException(status_code=401, detail="用户不存")
     return user
+
+
+def _get_scoped_document(
+    db: Session,
+    current_user: str,
+    document_id: int,
+    kb_role: str = "viewer",
+) -> tuple[User, Document]:
+    user = _get_user(db, current_user)
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
+    if doc.kb_id is None:
+        if doc.user_id != user.id:
+            raise HTTPException(status_code=403, detail="Document is outside your personal scope")
+    else:
+        from app.api.deps import check_kb_role
+
+        check_kb_role(db, current_user, doc.kb_id, kb_role)
+    return user, doc
+
+
+def _progress_percent(status_value: str) -> int:
+    return {
+        "uploaded": 5,
+        "queued": 10,
+        "waiting_lock": 12,
+        "retrying": 18,
+        "indexing": 25,
+        "parsing": 45,
+        "embedding": 75,
+        "indexed": 100,
+        "completed": 100,
+        "failed": 100,
+        "unknown": 0,
+        "not_found": 0,
+    }.get(status_value, 0)
 
 
 @router.get("/list")
@@ -99,6 +136,73 @@ def list_documents(
         }
         for d in docs
     ]
+
+
+@router.get("/{document_id}/progress")
+def document_index_progress(
+    document_id: int,
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _, doc = _get_scoped_document(db, current_user, document_id, "viewer")
+    progress = get_doc_index_progress(document_id)
+    progress_status = str(progress.get("status") or "")
+    effective_status = (
+        progress_status
+        if progress_status and progress_status not in {"not_found", "unknown"}
+        else str(doc.status or "unknown")
+    )
+    percent = _progress_percent(effective_status)
+    if doc.status in {"indexed", "completed"}:
+        effective_status = str(doc.status)
+        percent = 100
+    if doc.status == "failed":
+        effective_status = "failed"
+        percent = 100
+    return {
+        "document_id": doc.id,
+        "status": effective_status,
+        "document_status": doc.status,
+        "percent": percent,
+        "task_id": progress.get("task_id"),
+        "attempt": progress.get("attempt"),
+        "total_chunks": progress.get("total_chunks"),
+        "total_embeddings": progress.get("total_embeddings"),
+        "error_message": progress.get("error_message") or doc.error_message,
+        "updated_at": str(doc.updated_at) if doc.updated_at else None,
+    }
+
+
+@router.post("/{document_id}/reindex", status_code=202)
+def reindex_document(
+    document_id: int,
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    user, doc = _get_scoped_document(db, current_user, document_id, "editor")
+    progress_status = str(get_doc_index_progress(document_id).get("status") or "")
+    if doc.status in {"queued", "indexing"} or progress_status in {"queued", "waiting_lock", "retrying", "indexing", "parsing", "embedding"}:
+        raise HTTPException(status_code=409, detail="Document is already being indexed")
+    file_path = doc.storage_key or doc.file_path
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=409, detail="Original document file is not available for reindexing")
+    doc.status = "uploaded"
+    doc.error_message = None
+    db.commit()
+    try:
+        task_id = enqueue_document_index_task(doc.id, user.id, doc.kb_id)
+    except Exception as exc:
+        doc.status = "failed"
+        doc.error_message = f"Failed to enqueue reindex task: {exc}"
+        db.commit()
+        raise HTTPException(status_code=503, detail="Index queue is unavailable") from exc
+    return {
+        "id": doc.id,
+        "file_name": doc.original_file_name or doc.file_name,
+        "status": doc.status,
+        "task_id": task_id,
+        "kb_id": doc.kb_id,
+    }
 
 
 @router.delete("/{document_id}")

@@ -49,6 +49,69 @@ def test_uploader_can_delete_unclassified_document(
     assert response.status_code == 200
 
 
+def test_document_progress_merges_redis_and_database_state(
+    client, auth_user, db_session, factory, monkeypatch
+):
+    user, headers = auth_user
+    document = factory.document(db_session, user.id, status="indexing")
+    monkeypatch.setattr(
+        "app.api.document.get_doc_index_progress",
+        lambda _document_id: {"status": "embedding", "task_id": "task-1", "total_chunks": 8},
+    )
+
+    response = client.get(f"/document/{document.id}/progress", headers=headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "embedding"
+    assert body["percent"] == 75
+    assert body["task_id"] == "task-1"
+    assert body["total_chunks"] == 8
+
+
+def test_reindex_document_enqueues_existing_source(
+    client, auth_user, db_session, factory, monkeypatch, tmp_path
+):
+    user, headers = auth_user
+    source = tmp_path / "source.txt"
+    source.write_text("content", encoding="utf-8")
+    document = factory.document(
+        db_session,
+        user.id,
+        status="failed",
+        file_path=str(source),
+        storage_key=str(source),
+    )
+    monkeypatch.setattr("app.api.document.get_doc_index_progress", lambda _document_id: {"status": "not_found"})
+    monkeypatch.setattr("app.api.document.enqueue_document_index_task", lambda *_args: "task-2")
+
+    response = client.post(f"/document/{document.id}/reindex", headers=headers)
+
+    assert response.status_code == 202
+    assert response.json()["task_id"] == "task-2"
+    assert document.status == "uploaded"
+
+
+def test_reindex_rejects_active_index_task(
+    client, auth_user, db_session, factory, monkeypatch, tmp_path
+):
+    user, headers = auth_user
+    source = tmp_path / "source.txt"
+    source.write_text("content", encoding="utf-8")
+    document = factory.document(
+        db_session,
+        user.id,
+        status="uploaded",
+        file_path=str(source),
+        storage_key=str(source),
+    )
+    monkeypatch.setattr("app.api.document.get_doc_index_progress", lambda _document_id: {"status": "parsing"})
+
+    response = client.post(f"/document/{document.id}/reindex", headers=headers)
+
+    assert response.status_code == 409
+
+
 def test_other_user_cannot_delete_unclassified_document(
     client, auth_user, auth_user2, db_session, factory
 ):
