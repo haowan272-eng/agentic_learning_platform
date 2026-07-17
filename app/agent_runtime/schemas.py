@@ -10,6 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 TaskStatus = Literal["pending", "running", "waiting_user", "completed", "failed", "cancelled"]
 NextAction = Literal["dispatch", "repair", "replan", "ask_user", "fallback", "complete"]
+RouterRoute = Literal["direct_answer", "rag_retrieve", "supervisor_plan", "architect_agent", "verifier_agent", "final_response", "fallback_response"]
+ArchitectRoute = Literal["verifier_agent", "final_response"]
 PlanRoute = Literal["approval_gate", "dispatch_research"]
 VerificationRoute = Literal["final_response", "repair_plan", "approval_gate", "fallback_response"]
 
@@ -74,6 +76,9 @@ class AgentTaskState(TypedDict, total=False):
     document_id: int | None
     conversation_id: int | None
     memory_context: dict[str, Any]
+    route_decision: dict[str, Any]
+    route_source: str
+    route_error: str | None
     plan: dict[str, Any]
     planning_source: str
     planner_error: str | None
@@ -231,6 +236,9 @@ class AgentTaskStateModel(RuntimeModel):
     document_id: int | None = Field(default=None, ge=1)
     conversation_id: int | None = Field(default=None, ge=1)
     memory_context: dict[str, Any] = Field(default_factory=dict)
+    route_decision: dict[str, Any] = Field(default_factory=dict)
+    route_source: str | None = Field(default=None, max_length=128)
+    route_error: str | None = Field(default=None, max_length=4000)
     plan: dict[str, Any] = Field(default_factory=dict)
     planning_source: str | None = Field(default=None, max_length=128)
     planner_error: str | None = Field(default=None, max_length=4000)
@@ -271,6 +279,9 @@ class NodeUpdateModel(RuntimeModel):
     status: TaskStatus | None = None
     user_input: str | None = Field(default=None, min_length=1, max_length=8000)
     memory_context: dict[str, Any] | None = None
+    route_decision: dict[str, Any] | None = None
+    route_source: str | None = Field(default=None, max_length=128)
+    route_error: str | None = Field(default=None, max_length=4000)
     plan: dict[str, Any] | None = None
     goal: str | None = Field(default=None, max_length=8000)
     intent: str | None = Field(default=None, max_length=128)
@@ -293,6 +304,14 @@ class NodeUpdateModel(RuntimeModel):
 
 class PlanRouteModel(RuntimeModel):
     route: PlanRoute
+
+
+class RouterRouteModel(RuntimeModel):
+    route: RouterRoute
+
+
+class ArchitectRouteModel(RuntimeModel):
+    route: ArchitectRoute
 
 
 class VerificationRouteModel(RuntimeModel):
@@ -321,6 +340,14 @@ def validate_agent_event(event: dict[str, Any]) -> dict[str, Any]:
 
 def validate_plan_route(route: str) -> PlanRoute:
     return PlanRouteModel(route=route).route
+
+
+def validate_router_route(route: str) -> RouterRoute:
+    return RouterRouteModel(route=route).route
+
+
+def validate_architect_route(route: str) -> ArchitectRoute:
+    return ArchitectRouteModel(route=route).route
 
 
 def validate_verification_route(route: str) -> VerificationRoute:

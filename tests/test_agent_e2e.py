@@ -23,6 +23,7 @@ from app.agent_runtime.planner import (
     AgentPlan,
     ProposalSection,
     ResearchTask,
+    RouteDecision,
     UpgradeProposal,
     VerificationDecision,
     default_plan,
@@ -40,6 +41,7 @@ from app.agent_runtime.schemas import (
     validate_agent_state,
     validate_node_update,
     validate_research_work_item,
+    validate_router_route,
     validate_verification_route,
 )
 from app.agent_runtime.tools import call_tool
@@ -253,6 +255,107 @@ class TestHappyPath:
         assert len(store.verifications) >= 1, (
             f"Expected ≥1 verification, got {len(store.verifications)}"
         )
+
+
+# ── router path selection E2E ────────────────────────────────────────────────
+
+
+class TestRouterPathSelection:
+    @pytest.fixture(autouse=True)
+    def _setup_mocks(self):
+        with patch(
+            "app.agent_runtime.runtime.record_memory_event",
+        ), patch(
+            "app.agent_runtime.runtime.consolidate_task_memory", return_value=[],
+        ), patch(
+            "app.agent_runtime.runtime.summarize_task_session", return_value=None,
+        ), patch(
+            "app.agent_runtime.runtime.append_recent_event",
+        ), patch(
+            "app.agent_runtime.runtime.publish_task_event",
+        ):
+            yield
+
+    def test_direct_answer_route_finishes_without_heavy_chain(self):
+        from langgraph.checkpoint.memory import MemorySaver
+
+        store = FakeStore()
+        state = _make_base_state(task_type="chat", user_input="什么是 RAG？")
+
+        with patch(
+            "app.agent_runtime.runtime.generate_route",
+            return_value=(
+                RouteDecision(
+                    target_node="direct_answer",
+                    intent="direct_chat",
+                    reason="simple concept question",
+                    confidence=0.9,
+                    needs_rag=False,
+                    needs_verification=False,
+                    stop_after_node=True,
+                    response_mode="direct",
+                ),
+                "mock",
+                None,
+            ),
+        ):
+            graph = build_agent_graph(store, checkpointer=MemorySaver())
+            config = {"configurable": {"thread_id": state["task_id"]}}
+
+            for _ in graph.stream(state, config=config, stream_mode="updates"):
+                pass
+
+        final = dict(graph.get_state(config).values)
+        event_types = {event["event_type"] for event in store.events}
+        assert final["status"] == "completed"
+        assert final["grounding"]["mode"] == "direct"
+        assert "router.decided" in event_types
+        assert len(store.plans) == 0
+        assert len(store.tool_calls) == 0
+        assert len(store.verifications) == 0
+
+    def test_rag_route_retrieves_and_finishes_without_architect_or_verifier(self):
+        from langgraph.checkpoint.memory import MemorySaver
+
+        store = FakeStore()
+        state = _make_base_state(task_type="rag_question", user_input="知识库里有没有 TCP 三次握手？", kb_id=1)
+
+        with patch(
+            "app.agent_runtime.runtime.generate_route",
+            return_value=(
+                RouteDecision(
+                    target_node="rag_retrieve",
+                    intent="rag_question",
+                    reason="knowledge lookup only",
+                    confidence=0.92,
+                    needs_rag=True,
+                    needs_verification=False,
+                    stop_after_node=True,
+                    response_mode="rag_answer",
+                    query="TCP 三次握手",
+                ),
+                "mock",
+                None,
+            ),
+        ), patch(
+            "app.agent_runtime.runtime.call_tool",
+            return_value=_fake_research_result(ok=True, citations=True),
+        ):
+            graph = build_agent_graph(store, checkpointer=MemorySaver())
+            config = {"configurable": {"thread_id": state["task_id"]}}
+
+            for _ in graph.stream(state, config=config, stream_mode="updates"):
+                pass
+
+        final = dict(graph.get_state(config).values)
+        event_agents = {event.get("agent_name") for event in store.events}
+        assert final["status"] == "completed"
+        assert final["grounding"]["rag_used"] is True
+        assert "rag_retrieve" in event_agents
+        assert "architect_agent" not in event_agents
+        assert len(store.plans) == 0
+        assert len(store.tool_calls) == 1
+        assert len(store.verifications) == 0
 
 
 # ── repair loop E2E ─────────────────────────────────────────────────────────
@@ -669,6 +772,10 @@ class TestAgentTaskStateInvariants:
     def test_pydantic_route_boundary_rejects_unknown_verifier_route(self):
         with pytest.raises(ValidationError):
             validate_verification_route("skip_final")
+
+    def test_pydantic_router_route_boundary_rejects_unknown_target(self):
+        with pytest.raises(ValidationError):
+            validate_router_route("research_agent")
 
     def test_minimal_state_is_accepted_by_graph_builder(self):
         from langgraph.checkpoint.memory import MemorySaver

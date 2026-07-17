@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, ValidationError
@@ -12,6 +12,7 @@ from app.core.config import AGENT_PLANNER_CANDIDATE_COUNT
 
 from .llm_gateway import TokenCallback, llm_gateway
 from .prompt_registry import ABMetric, prompt_registry
+from .schemas import RouterRoute
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,18 @@ class AgentPlan(BaseModel):
 class PlanSelection(BaseModel):
     selected_index: int = Field(ge=0, le=2)
     rationale: str = Field(..., min_length=1, max_length=500)
+
+
+class RouteDecision(BaseModel):
+    target_node: RouterRoute
+    intent: str = Field(..., min_length=1, max_length=128)
+    reason: str = Field(..., min_length=1, max_length=1000)
+    confidence: float = Field(ge=0, le=1)
+    needs_rag: bool
+    needs_verification: bool
+    stop_after_node: bool
+    response_mode: Literal["direct", "rag_answer", "draft", "verified_plan", "fallback"]
+    query: str | None = Field(default=None, max_length=2000)
 
 
 class ProposalSection(BaseModel):
@@ -77,6 +90,70 @@ def default_plan(state: dict[str, Any]) -> AgentPlan:
 # Extracted to module-level constants for easier iteration and testing.
 
 
+def default_route_decision(state: dict[str, Any], *, reason: str | None = None) -> RouteDecision:
+    user_input = str(state.get("user_input") or "").strip()
+    task_type = str(state.get("task_type") or "").lower()
+    text = user_input.lower()
+    has_rag_scope = bool(state.get("kb_id") or state.get("document_id") or state.get("conversation_id"))
+    heavy_terms = (
+        "面试", "提优", "提升", "学习计划", "学习提升", "方案", "规划", "设计", "架构",
+        "重构", "工程化", "评估", "诊断", "复盘", "简历", "岗位", "agent", "rag",
+    )
+    rag_terms = ("知识库", "文档", "资料", "有没有", "查", "检索", "引用", "根据", "材料")
+    direct_terms = ("是什么", "解释", "什么意思", "区别", "怎么理解", "hello", "你好")
+
+    if any(term in task_type for term in ("project", "upgrade", "improvement", "interview")) or any(term in text for term in heavy_terms):
+        return RouteDecision(
+            target_node="supervisor_plan",
+            intent=str(state.get("task_type") or "interview_improvement"),
+            reason=reason or "任务需要拆解、检索、生成方案与质量校验，进入完整多 Agent 提优链路。",
+            confidence=0.72,
+            needs_rag=True,
+            needs_verification=True,
+            stop_after_node=False,
+            response_mode="verified_plan",
+            query=user_input,
+        )
+
+    if has_rag_scope or any(term in text for term in rag_terms):
+        return RouteDecision(
+            target_node="rag_retrieve",
+            intent="rag_question",
+            reason=reason or "用户主要需要基于知识库或文档材料的检索回答，不需要完整方案生成。",
+            confidence=0.68,
+            needs_rag=True,
+            needs_verification=False,
+            stop_after_node=True,
+            response_mode="rag_answer",
+            query=user_input,
+        )
+
+    if len(user_input) <= 160 or any(term in text for term in direct_terms):
+        return RouteDecision(
+            target_node="direct_answer",
+            intent="direct_chat",
+            reason=reason or "问题可以轻量回答，不需要 RAG 检索或多 Agent 编排。",
+            confidence=0.62,
+            needs_rag=False,
+            needs_verification=False,
+            stop_after_node=True,
+            response_mode="direct",
+            query=None,
+        )
+
+    return RouteDecision(
+        target_node="supervisor_plan",
+        intent=str(state.get("task_type") or "interview_improvement"),
+        reason=reason or "任务边界不够简单，保守进入完整多 Agent 提优链路。",
+        confidence=0.55,
+        needs_rag=True,
+        needs_verification=True,
+        stop_after_node=False,
+        response_mode="verified_plan",
+        query=user_input,
+    )
+
+
 def _render_prompt(name: str, variables: dict[str, Any], *, role: str = "planner", state: dict[str, Any] | None = None) -> str:
     """Render a prompt via the registry, with few-shot example injection."""
     result = prompt_registry.render(name, variables, role=role)
@@ -94,6 +171,21 @@ def _render_prompt(name: str, variables: dict[str, Any], *, role: str = "planner
             result.text += example_block
 
     return result.text
+
+
+def _router_prompt(state: dict[str, Any]) -> str:
+    return _render_prompt("llm_router", {
+        "user_input": state.get("user_input", ""),
+        "task_type": state.get("task_type", "interview_improvement"),
+        "memory_context": state.get("memory_context", {}),
+        "has_rag_scope": bool(state.get("kb_id") or state.get("document_id") or state.get("conversation_id")),
+        "existing_artifact_count": len(state.get("artifacts", []) or []),
+        "has_proposal": bool(state.get("proposal")),
+        "allowed_targets": [
+            "direct_answer", "rag_retrieve", "supervisor_plan", "architect_agent",
+            "verifier_agent", "final_response", "fallback_response",
+        ],
+    }, role="planner", state=state)
 
 
 def _planner_prompt(state: dict[str, Any]) -> str:
@@ -201,6 +293,21 @@ def _invoke_structured(
 
 
 # ── Public orchestration entry points ─────────────────────────────────
+
+
+def generate_route(
+    state: dict[str, Any], *, on_token: TokenCallback | None = None,
+) -> tuple[RouteDecision, str, str | None]:
+    try:
+        decision, source, _ptk, _ctk = _invoke_structured(
+            "planner", _router_prompt(state), RouteDecision, on_token,
+            template_name="llm_router", task_id=str(state.get("task_id", "")),
+        )
+        return decision, source, None  # type: ignore[return-value]
+    except Exception as exc:  # noqa: BLE001
+        error = f"Router LLM call failed; applied deterministic route: {exc}"
+        logger.warning(error)
+        return default_route_decision(state, reason=error), "fallback", error
 
 
 def generate_plan(

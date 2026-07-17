@@ -132,6 +132,25 @@ artifacts：{{ artifacts | tojson }}
 要求：
 1. 关键建议缺少证据时选择 repair。
 2. 无法通过检索修复时选择 fallback。""",
+
+    "llm_router": """\
+你是学习提升平台的 LLM Router。你的任务是只做路由判断，不生成最终答案，不调用工具。
+
+用户输入：{{ user_input }}
+任务类型：{{ task_type }}
+可信记忆上下文：{{ memory_context | tojson }}
+是否有知识库/文档/会话检索范围：{{ has_rag_scope }}
+已有 artifact 数量：{{ existing_artifact_count }}
+是否已有 proposal：{{ has_proposal }}
+允许目标节点：{{ allowed_targets | tojson }}
+
+路由原则：
+1. 简单解释、闲聊、概念问题选择 direct_answer，并 stop_after_node=true。
+2. 只需要基于知识库/文档回答的问题选择 rag_retrieve，并 stop_after_node=true。
+3. 面试提优、学习提升方案、工程化诊断、项目重构建议选择 supervisor_plan，并 needs_verification=true。
+4. 已有证据但只需要生成草案时可以选择 architect_agent。
+5. 已有 proposal 且只需要校验时可以选择 verifier_agent。
+6. 只能从允许目标节点中选择，输出必须通过 JSON 结构校验。""",
 }
 
 

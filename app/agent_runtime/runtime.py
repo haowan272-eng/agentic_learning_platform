@@ -11,7 +11,8 @@ from app.memory.service import build_context_for_state, consolidate_task_memory,
 from app.memory.short_term import append_recent_event
 from app.observability import increment, observe_ms
 
-from .planner import AgentPlan, ResearchTask, generate_plan, generate_proposal, verify_proposal
+from .llm_gateway import llm_gateway
+from .planner import AgentPlan, ResearchTask, generate_plan, generate_proposal, generate_route, verify_proposal
 from .schemas import (
     AgentEvent,
     AgentMessage,
@@ -19,11 +20,13 @@ from .schemas import (
     Artifact,
     ResearchWorkItem,
     RuntimeStore,
+    validate_architect_route,
     validate_agent_event,
     validate_agent_state,
     validate_node_update,
     validate_plan_route,
     validate_research_work_item,
+    validate_router_route,
     validate_verification_route,
 )
 from .tools import call_tool
@@ -120,6 +123,128 @@ def _enforce_policy(state: dict[str, Any], store: RuntimeStore) -> None:
                 raise AgentBudgetExceeded("Task deadline exceeded.")
         except ValueError:
             pass
+
+
+def _llm_router(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
+    decision, source, error = generate_route(state, on_token=_llm_token_callback(state, "llm_router"))
+    route_payload = decision.model_dump(mode="json")
+    event = _event(
+        state,
+        store,
+        "router.decided",
+        f"Router selected {decision.target_node}.",
+        agent_name="llm_router",
+        payload={"source": source, "decision": route_payload, "error": error},
+    )
+    return validate_node_update({
+        "intent": decision.intent,
+        "route_decision": route_payload,
+        "route_source": source,
+        "route_error": error,
+        "status": "running",
+        "emitted_events": [event],
+    })
+
+
+def _router_route(state: AgentTaskState) -> str:
+    state = validate_agent_state(state)
+    decision = state.get("route_decision") or {}
+    target = str(decision.get("target_node") or "supervisor_plan")
+    return validate_router_route(target)
+
+
+def _direct_answer(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
+    source = "fallback"
+    try:
+        response = llm_gateway.invoke(
+            role="planner",
+            prompt=(
+                "你是学习提升平台的轻量答疑助手。请直接回答用户问题，"
+                "不要声称执行了知识库检索、工具调用或多 Agent 工作流。\n\n"
+                f"用户问题：{state.get('user_input', '')}"
+            ),
+            on_token=_llm_token_callback(state, "direct_answer"),
+        )
+        answer = response.content.strip()
+        source = f"{response.provider}:{response.model}"
+    except Exception:  # noqa: BLE001
+        answer = (
+            "这是一个轻量问题，不需要进入完整多 Agent 提优链路。"
+            f"\n\n你的问题：{state.get('user_input', '')}"
+        )
+    event = _event(
+        state,
+        store,
+        "task.completed",
+        "Router completed the task through direct answer.",
+        agent_name="direct_answer",
+        payload={"route_decision": state.get("route_decision") or {}, "model_source": source},
+    )
+    return validate_node_update({
+        "status": "completed",
+        "final_answer": answer,
+        "grounding": {"mode": "direct", "rag_used": False},
+        "emitted_events": [event],
+    })
+
+
+def _rag_retrieve(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
+    decision = state.get("route_decision") or {}
+    query = str(decision.get("query") or state.get("user_input") or "")
+    start = _event(state, store, "agent.started", "Router dispatched a lightweight RAG retrieval.", agent_name="rag_retrieve", payload={"query": query})
+    result = call_tool(
+        "knowledge.answer",
+        {
+            "query": query,
+            "username": state["username"],
+            "user_id": state.get("user_id"),
+            "kb_id": state.get("kb_id"),
+            "document_id": state.get("document_id"),
+            "conversation_id": state.get("conversation_id"),
+            "top_k": 5,
+            "use_memory": True,
+            "rewrite_query": True,
+        },
+        agent="research_agent",
+    )
+    artifact: Artifact = {
+        "artifact_id": f"rag-{uuid4().hex[:12]}",
+        "kind": "research",
+        "producer": "rag_retrieve",
+        "correlation_id": "rag_retrieve",
+        "data": result.get("data") or {},
+        "citations": result.get("citations") or [],
+        "confidence": float(result.get("confidence") or 0),
+        "error": result.get("error"),
+    }
+    store.save_tool_call({"task_id": state["task_id"], "run_id": state["run_id"], "step_id": "rag_retrieve", "agent_name": "rag_retrieve", "skill_name": "knowledge_grounding", "tool_name": "knowledge.answer", "input": {"query": query, "top_k": 5}, "output": result, "result": result, "ok": bool(result.get("ok")), "error_type": (result.get("error") or {}).get("type"), "error_message": (result.get("error") or {}).get("message"), "retry_count": 0, "latency_ms": result.get("latency_ms")})
+    answer = str((result.get("data") or {}).get("answer") or "")
+    if not answer:
+        answer = "当前没有检索到足够的知识库内容。请先上传并完成索引，或换一个更具体的问题。"
+    done = _event(
+        state,
+        store,
+        "task.completed" if result.get("ok") else "agent.failed",
+        "Lightweight RAG retrieval completed.",
+        agent_name="rag_retrieve",
+        tool_name="knowledge.answer",
+        step_id="rag_retrieve",
+        payload={"artifact_id": artifact["artifact_id"], "ok": bool(result.get("ok"))},
+    )
+    update: dict[str, Any] = {
+        "status": "completed",
+        "final_answer": answer,
+        "citations": result.get("citations") or [],
+        "grounding": result.get("grounding") or {"mode": "rag_answer", "rag_used": True},
+        "artifacts": [artifact],
+        "emitted_events": [start, done],
+    }
+    if result.get("error"):
+        update["errors"] = [{"source": "rag_retrieve", "error_type": (result.get("error") or {}).get("type", "rag_failed"), "message": (result.get("error") or {}).get("message", "RAG retrieval failed."), "retryable": bool((result.get("error") or {}).get("retryable", True)), "correlation_id": "rag_retrieve"}]
+    return validate_node_update(update)
 
 
 def _supervisor_plan(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
@@ -248,6 +373,14 @@ def _architect_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, An
     return validate_node_update({"proposal": artifact["data"], "artifacts": [artifact], "emitted_events": [event]})
 
 
+def _architect_route(state: AgentTaskState) -> str:
+    state = validate_agent_state(state)
+    decision = state.get("route_decision") or {}
+    if decision.get("target_node") == "architect_agent" and not bool(decision.get("needs_verification", True)):
+        return validate_architect_route("final_response")
+    return validate_architect_route("verifier_agent")
+
+
 def _verifier_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
     state = validate_agent_state(state)
     decision, error, source = verify_proposal(state, on_token=_llm_token_callback(state, "verifier_agent"))
@@ -333,6 +466,9 @@ def build_agent_graph(store: RuntimeStore, *, checkpointer: Any) -> Any:
     if StateGraph is None:
         raise RuntimeError(f"langgraph is required for Agent Runtime: {LANGGRAPH_IMPORT_ERROR}")
     builder = StateGraph(AgentTaskState)
+    builder.add_node("llm_router", lambda state: _llm_router(state, store))
+    builder.add_node("direct_answer", lambda state: _direct_answer(state, store))
+    builder.add_node("rag_retrieve", lambda state: _rag_retrieve(state, store))
     builder.add_node("supervisor_plan", lambda state: _supervisor_plan(state, store))
     builder.add_node("approval_gate", lambda state: _approval_gate(state, store))
     builder.add_node("dispatch_research", lambda state: state)
@@ -342,15 +478,26 @@ def build_agent_graph(store: RuntimeStore, *, checkpointer: Any) -> Any:
     builder.add_node("repair_plan", lambda state: _repair_plan(state, store))
     builder.add_node("final_response", lambda state: _final_response(state, store))
     builder.add_node("fallback_response", lambda state: _fallback_response(state, store))
-    builder.add_edge(START, "supervisor_plan")
+    builder.add_edge(START, "llm_router")
+    builder.add_conditional_edges("llm_router", _router_route, {
+        "direct_answer": "direct_answer",
+        "rag_retrieve": "rag_retrieve",
+        "supervisor_plan": "supervisor_plan",
+        "architect_agent": "architect_agent",
+        "verifier_agent": "verifier_agent",
+        "final_response": "final_response",
+        "fallback_response": "fallback_response",
+    })
     builder.add_conditional_edges("supervisor_plan", _plan_route, {"approval_gate": "approval_gate", "dispatch_research": "dispatch_research"})
     # Dynamically fan-out research tasks via Send; Architect runs as a fan-in
     # barrier once every dispatched Research Agent has completed.
     builder.add_conditional_edges("dispatch_research", _dispatch_research, ["research_agent"])
     builder.add_edge("research_agent", "architect_agent")
-    builder.add_edge("architect_agent", "verifier_agent")
+    builder.add_conditional_edges("architect_agent", _architect_route, {"verifier_agent": "verifier_agent", "final_response": "final_response"})
     builder.add_conditional_edges("verifier_agent", _verification_route, {"final_response": "final_response", "repair_plan": "repair_plan", "approval_gate": "approval_gate", "fallback_response": "fallback_response"})
     builder.add_edge("repair_plan", "dispatch_research")
+    builder.add_edge("direct_answer", END)
+    builder.add_edge("rag_retrieve", END)
     builder.add_edge("final_response", END)
     builder.add_edge("fallback_response", END)
     return builder.compile(checkpointer=checkpointer)
