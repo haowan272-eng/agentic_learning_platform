@@ -86,6 +86,29 @@ class ABMetric:
 # ── fallback templates (mirror planner.py) ────────────────────────────
 
 FALLBACK_TEMPLATES: dict[str, str] = {
+    "supervisor_agent": """\
+You are the Supervisor Agent for an interview-improvement learning platform.
+Your only job is delegation. Do not answer the user directly and do not execute tools.
+
+User input: {{ user_input }}
+Task type: {{ task_type }}
+Trusted memory context: {{ memory_context | tojson }}
+Has scoped knowledge/document/conversation retrieval: {{ has_rag_scope }}
+Existing artifact count: {{ existing_artifact_count }}
+Has proposal: {{ has_proposal }}
+Allowed child agents: {{ allowed_child_agents | tojson }}
+Allowed graph routes: {{ allowed_routes | tojson }}
+
+Delegation rules:
+1. For simple concept or chat questions, choose child_agents=["direct_answer_agent"], route="direct_answer", stop_after_children=true.
+2. For knowledge-base or document grounded answers, choose child_agents=["tool_agent"], route="tool_planner", needs_tools=true.
+3. For explicit learning_coach, diagnostic, practice, or coach task types, choose child_agents=["diagnostic_agent","practice_agent","coach_agent"], route="learning_coach".
+4. For interview improvement, learning upgrade, project diagnosis, architecture, refactor, or engineering plans, choose child_agents=["research_agent","architect_agent","verifier_agent"], route="supervisor_plan".
+5. If enough evidence already exists and only a design draft is needed, choose route="architect_agent".
+6. If a proposal already exists and only quality checking is needed, choose route="verifier_agent".
+7. Only choose values from the allowed lists and produce data that satisfies the required JSON schema.
+""",
+
     "supervisor_plan": """\
 你是面试提优学习系统中的 Supervisor Agent。
 你的任务是把用户目标拆成 1 到 4 个彼此独立、可并行执行的知识检索任务。
@@ -132,26 +155,6 @@ artifacts：{{ artifacts | tojson }}
 要求：
 1. 关键建议缺少证据时选择 repair。
 2. 无法通过检索修复时选择 fallback。""",
-
-    "llm_router": """\
-你是学习提升平台的 LLM Router。你的任务是只做路由判断，不生成最终答案，不调用工具。
-
-用户输入：{{ user_input }}
-任务类型：{{ task_type }}
-可信记忆上下文：{{ memory_context | tojson }}
-是否有知识库/文档/会话检索范围：{{ has_rag_scope }}
-已有 artifact 数量：{{ existing_artifact_count }}
-是否已有 proposal：{{ has_proposal }}
-允许目标节点：{{ allowed_targets | tojson }}
-
-路由原则：
-1. 简单解释、闲聊、概念问题选择 direct_answer，并 stop_after_node=true。
-2. 需要自主选择工具或基于知识库/文档回答的问题优先选择 tool_planner。
-3. 只有非常明确的单次知识库问答才可以选择 rag_retrieve，并 stop_after_node=true。
-4. 面试提优、学习提升方案、工程化诊断、项目重构建议选择 supervisor_plan，并 needs_verification=true。
-5. 已有证据但只需要生成草案时可以选择 architect_agent。
-6. 已有 proposal 且只需要校验时可以选择 verifier_agent。
-7. 只能从允许目标节点中选择，输出必须通过 JSON 结构校验。""",
 
     "tool_planner": """\
 你是学习提升平台的 Tool Planner。你的任务是选择必要且最少的工具调用，不执行工具，不生成最终答案。

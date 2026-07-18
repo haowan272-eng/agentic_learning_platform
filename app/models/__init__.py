@@ -20,6 +20,14 @@ from .agent_runtime import (
     MemoryEvent,
     SessionSummary,
 )
+from .learning import (
+    LearningAssessment,
+    LearningEvent,
+    LearningPractice,
+    LearningProfile,
+    LearningReviewItem,
+    LearningWeakness,
+)
 
 __all__ = [
     "User", "Document",
@@ -30,4 +38,6 @@ __all__ = [
     "AgentTask", "AgentSession", "AgentRun", "AgentEvent", "AgentPlan", "AgentStep",
     "AgentTool", "AgentToolPermission", "AgentToolCall", "AgentVerification",
     "MemoryEvent", "SessionSummary",
+    "LearningProfile", "LearningWeakness", "LearningPractice", "LearningAssessment",
+    "LearningReviewItem", "LearningEvent",
 ]

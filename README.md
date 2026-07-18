@@ -74,7 +74,7 @@ Important defaults:
 ```env
 DATABASE_URL=postgresql://interview_user:interview_password@127.0.0.1:15432/interview_improvement_rag
 REDIS_URL=redis://localhost:16379/0
-QDRANT_URL=http://localhost:6333
+QDRANT_URL=http://localhost:16333
 QDRANT_COLLECTION_NAME=interview_improvement_chunks
 CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://localhost:8001,http://127.0.0.1:8001
 ```
@@ -95,7 +95,7 @@ Frontend:   http://localhost:5173
 API docs:   http://localhost:8001/docs
 PostgreSQL: localhost:15432
 Redis:      localhost:16379
-Qdrant:     http://localhost:6333
+Qdrant:     http://localhost:16333
 ```
 
 Run the backend without Docker when dependencies are already available:

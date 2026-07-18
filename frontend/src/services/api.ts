@@ -101,6 +101,65 @@ export type AgentEvent = {
   created_at: string;
 };
 
+export type LearningProfile = {
+  id: number;
+  target_role?: string | null;
+  goal?: string | null;
+  current_level: string;
+  weekly_minutes: number;
+  preferences: Record<string, unknown>;
+  diagnostic_summary?: string | null;
+  readiness_score: number;
+  updated_at?: string | null;
+};
+
+export type LearningWeakness = {
+  id: number;
+  topic: string;
+  category: string;
+  severity: number;
+  confidence: number;
+  evidence: Record<string, unknown>;
+  status: string;
+  updated_at?: string | null;
+};
+
+export type LearningPractice = {
+  id: number;
+  task_id?: string | null;
+  kb_id?: number | null;
+  topic: string;
+  question: string;
+  expected_answer?: string | null;
+  difficulty: string;
+  source: Record<string, unknown>;
+  status: string;
+  created_at?: string | null;
+};
+
+export type LearningReviewItem = {
+  id: number;
+  weakness_id?: number | null;
+  topic: string;
+  prompt: string;
+  due_at: string;
+  interval_days: number;
+  status: string;
+};
+
+export type LearningDashboard = {
+  active_days_14d: number;
+  tasks_completed_14d: number;
+  practice_accuracy: number;
+  open_weaknesses: number;
+  weakness_trend: Array<{ category: string; count: number }>;
+  material_hit_rate: number;
+  agent_saved_minutes: number;
+  due_reviews: number;
+  recent_practices: LearningPractice[];
+  top_weaknesses: LearningWeakness[];
+};
+
 const API_BASE = import.meta.env.VITE_API_BASE?.replace(/\/$/, "") ?? "";
 const ACCESS_KEY = "interview_improvement_rag_access";
 const REFRESH_KEY = "interview_improvement_rag_refresh";
@@ -289,6 +348,7 @@ export function createAgentTask(payload: {
   user_input: string;
   task_type?: string;
   kb_id?: number;
+  document_id?: number;
   conversation_id?: number;
   max_steps?: number;
   max_tool_calls?: number;
@@ -371,4 +431,37 @@ export async function streamAgentEvents(
 
 export function cancelAgentTask(taskId: string) {
   return requestJson<AgentTask>(`/agent/tasks/${taskId}/cancel`, { method: "POST" });
+}
+
+export function getLearningProfile() {
+  return requestJson<LearningProfile>("/learning/profile");
+}
+
+export function updateLearningProfile(payload: {
+  target_role?: string | null;
+  goal?: string | null;
+  current_level: string;
+  weekly_minutes: number;
+  preferences?: Record<string, unknown>;
+}) {
+  return requestJson<LearningProfile>("/learning/profile", {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function listLearningWeaknesses() {
+  return requestJson<LearningWeakness[]>("/learning/weaknesses");
+}
+
+export function listLearningPractices() {
+  return requestJson<LearningPractice[]>("/learning/practices");
+}
+
+export function listLearningReviews() {
+  return requestJson<LearningReviewItem[]>("/learning/reviews");
+}
+
+export function getLearningDashboard() {
+  return requestJson<LearningDashboard>("/learning/dashboard");
 }

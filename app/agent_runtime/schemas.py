@@ -10,7 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 TaskStatus = Literal["pending", "running", "waiting_user", "completed", "failed", "cancelled"]
 NextAction = Literal["dispatch", "repair", "replan", "ask_user", "fallback", "complete"]
-RouterRoute = Literal["direct_answer", "rag_retrieve", "tool_planner", "supervisor_plan", "architect_agent", "verifier_agent", "final_response", "fallback_response"]
+ChildAgent = Literal["direct_answer_agent", "tool_agent", "research_agent", "architect_agent", "verifier_agent", "diagnostic_agent", "practice_agent", "coach_agent"]
+SupervisorRoute = Literal["direct_answer", "tool_planner", "supervisor_plan", "learning_coach", "architect_agent", "verifier_agent", "final_response", "fallback_response"]
 ArchitectRoute = Literal["verifier_agent", "final_response"]
 ToolExecutorRoute = Literal["tool_response", "architect_agent", "verifier_agent", "fallback_response"]
 PlanRoute = Literal["approval_gate", "dispatch_research"]
@@ -39,7 +40,7 @@ class AgentMessage(TypedDict, total=False):
     message_id: str
     from_agent: str
     to_agent: str
-    kind: Literal["delegate", "result", "repair_request", "replan_request", "approval_request"]
+    kind: Literal["delegate", "result", "tool_request", "tool_result", "repair_request", "replan_request", "approval_request"]
     correlation_id: str
     payload: dict[str, Any]
 
@@ -77,11 +78,14 @@ class AgentTaskState(TypedDict, total=False):
     document_id: int | None
     conversation_id: int | None
     memory_context: dict[str, Any]
+    supervisor_decision: dict[str, Any]
+    supervisor_source: str
+    supervisor_error: str | None
     route_decision: dict[str, Any]
     route_source: str
     route_error: str | None
     tool_plan: dict[str, Any]
-    tool_feedback: dict[str, Any]
+    tool_feedback: Annotated[dict[str, Any], operator.or_]
     plan: dict[str, Any]
     planning_source: str
     planner_error: str | None
@@ -184,7 +188,7 @@ class AgentMessageModel(RuntimeModel):
     message_id: str = Field(..., min_length=1, max_length=128)
     from_agent: str = Field(..., min_length=1, max_length=64)
     to_agent: str = Field(..., min_length=1, max_length=64)
-    kind: Literal["delegate", "result", "repair_request", "replan_request", "approval_request"]
+    kind: Literal["delegate", "result", "tool_request", "tool_result", "repair_request", "replan_request", "approval_request"]
     correlation_id: str = Field(..., min_length=1, max_length=128)
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -239,6 +243,9 @@ class AgentTaskStateModel(RuntimeModel):
     document_id: int | None = Field(default=None, ge=1)
     conversation_id: int | None = Field(default=None, ge=1)
     memory_context: dict[str, Any] = Field(default_factory=dict)
+    supervisor_decision: dict[str, Any] = Field(default_factory=dict)
+    supervisor_source: str | None = Field(default=None, max_length=128)
+    supervisor_error: str | None = Field(default=None, max_length=4000)
     route_decision: dict[str, Any] = Field(default_factory=dict)
     route_source: str | None = Field(default=None, max_length=128)
     route_error: str | None = Field(default=None, max_length=4000)
@@ -284,6 +291,9 @@ class NodeUpdateModel(RuntimeModel):
     status: TaskStatus | None = None
     user_input: str | None = Field(default=None, min_length=1, max_length=8000)
     memory_context: dict[str, Any] | None = None
+    supervisor_decision: dict[str, Any] | None = None
+    supervisor_source: str | None = Field(default=None, max_length=128)
+    supervisor_error: str | None = Field(default=None, max_length=4000)
     route_decision: dict[str, Any] | None = None
     route_source: str | None = Field(default=None, max_length=128)
     route_error: str | None = Field(default=None, max_length=4000)
@@ -313,8 +323,8 @@ class PlanRouteModel(RuntimeModel):
     route: PlanRoute
 
 
-class RouterRouteModel(RuntimeModel):
-    route: RouterRoute
+class SupervisorRouteModel(RuntimeModel):
+    route: SupervisorRoute
 
 
 class ArchitectRouteModel(RuntimeModel):
@@ -353,8 +363,8 @@ def validate_plan_route(route: str) -> PlanRoute:
     return PlanRouteModel(route=route).route
 
 
-def validate_router_route(route: str) -> RouterRoute:
-    return RouterRouteModel(route=route).route
+def validate_supervisor_route(route: str) -> SupervisorRoute:
+    return SupervisorRouteModel(route=route).route
 
 
 def validate_architect_route(route: str) -> ArchitectRoute:

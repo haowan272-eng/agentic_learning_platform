@@ -30,10 +30,15 @@ import {
   createAgentTask,
   createKnowledgeBase,
   getDocumentProgress,
+  getLearningDashboard,
+  getLearningProfile,
   listAgentEvents,
   listAgentTasks,
   listDocuments,
   listKnowledgeBases,
+  listLearningPractices,
+  listLearningReviews,
+  listLearningWeaknesses,
   login,
   reindexDocument,
   register,
@@ -46,7 +51,12 @@ import {
   type AnswerResponse,
   type DocumentProgress,
   type DocumentItem,
-  type KnowledgeBase
+  type KnowledgeBase,
+  type LearningDashboard,
+  type LearningPractice,
+  type LearningProfile,
+  type LearningReviewItem,
+  type LearningWeakness
 } from "@/services/api";
 
 type Mode = {
@@ -54,6 +64,17 @@ type Mode = {
   label: string;
   prompt: string;
   helper: string;
+};
+
+type LearningRoute = "question_answering" | "learning_system_design" | "clarify";
+
+type RouteDecision = {
+  route: LearningRoute;
+  label: string;
+  reason: string;
+  confidence: number;
+  ragQuery?: string;
+  planningGoal?: string;
 };
 
 const modes: Mode[] = [
@@ -99,6 +120,11 @@ const state = reactive({
   docProgresses: {} as Record<number, DocumentProgress>,
   tasks: [] as AgentTask[],
   events: [] as AgentEvent[],
+  learningProfile: null as LearningProfile | null,
+  learningDashboard: null as LearningDashboard | null,
+  weaknesses: [] as LearningWeakness[],
+  practices: [] as LearningPractice[],
+  reviews: [] as LearningReviewItem[],
   selectedKbId: 0,
   selectedDocId: 0,
   newKbName: "面试提优资料库",
@@ -109,6 +135,8 @@ const state = reactive({
   useMemory: true,
   rewriteQuery: true,
   answer: null as AnswerResponse | null,
+  routeDecision: null as RouteDecision | null,
+  routeBusy: false,
   conversationId: 0,
   selectedMode: modes[0],
   busy: false,
@@ -116,6 +144,7 @@ const state = reactive({
   docBusyId: 0,
   taskBusy: false,
   agentStreaming: false,
+  learningBusy: false,
   error: ""
 });
 
@@ -128,6 +157,13 @@ const failedDocs = computed(() => state.docs.filter((doc) => effectiveDocStatus(
 const selectedDocStatus = computed(() => selectedDoc.value ? effectiveDocStatus(selectedDoc.value) : "");
 const selectedDocCanSearch = computed(() => !selectedDoc.value || isIndexedStatus(selectedDocStatus.value));
 const selectedDocProgress = computed(() => selectedDoc.value ? progressFor(selectedDoc.value) : null);
+const routeLabel = computed(() => state.routeDecision?.label ?? "等待主 Agent 判断");
+const routeTone = computed(() => {
+  if (!state.routeDecision) return "idle";
+  if (state.routeDecision.route === "question_answering") return "qa";
+  if (state.routeDecision.route === "learning_system_design") return "agent";
+  return "clarify";
+});
 let documentProgressTimer: number | undefined;
 let agentStreamAbort: AbortController | null = null;
 let activeAgentStreamTaskId = "";
@@ -307,12 +343,40 @@ function logout() {
   state.docProgresses = {};
   state.tasks = [];
   state.events = [];
+  state.learningProfile = null;
+  state.learningDashboard = null;
+  state.weaknesses = [];
+  state.practices = [];
+  state.reviews = [];
   state.answer = null;
 }
 
 async function bootstrap() {
   state.error = "";
-  await Promise.all([refreshKbs(), refreshTasks()]);
+  await Promise.all([refreshKbs(), refreshTasks(), refreshLearning()]);
+}
+
+async function refreshLearning() {
+  if (!state.token) return;
+  state.learningBusy = true;
+  try {
+    const [profile, dashboard, weaknesses, practices, reviews] = await Promise.all([
+      getLearningProfile(),
+      getLearningDashboard(),
+      listLearningWeaknesses(),
+      listLearningPractices(),
+      listLearningReviews()
+    ]);
+    state.learningProfile = profile;
+    state.learningDashboard = dashboard;
+    state.weaknesses = weaknesses;
+    state.practices = practices;
+    state.reviews = reviews;
+  } catch (error) {
+    state.error = messageFromError(error, "学习数据刷新失败。");
+  } finally {
+    state.learningBusy = false;
+  }
 }
 
 async function refreshKbs() {
@@ -399,6 +463,76 @@ async function onUpload(event: Event) {
 function selectMode(mode: Mode) {
   state.selectedMode = mode;
   state.query = `${mode.prompt}\n\n`;
+}
+
+function routeLearningRequest(input: string): RouteDecision {
+  const text = input.trim();
+  const normalized = text.toLowerCase();
+  const planningSignals = [
+    "提升", "规划", "计划", "路线", "学习路径", "诊断", "薄弱", "练习", "训练", "模拟",
+    "复盘", "批改", "评价我的", "帮我准备", "怎么学", "安排", "制定",
+    "improve", "plan", "roadmap", "practice", "diagnose", "mock", "review", "coach"
+  ];
+  const questionSignals = [
+    "是什么", "为什么", "区别", "原理", "解释", "怎么理解", "对比", "举例",
+    "what", "why", "explain", "difference", "compare", "how does"
+  ];
+  const hasPlanningIntent = planningSignals.some((item) => normalized.includes(item.toLowerCase()));
+  const hasQuestionIntent = questionSignals.some((item) => normalized.includes(item.toLowerCase())) || /[?？]$/.test(text);
+  if (!text) {
+    return {
+      route: "clarify",
+      label: "需要补充输入",
+      reason: "请输入一个具体问题，或描述你想提升的学习目标。",
+      confidence: 1
+    };
+  }
+  if (hasPlanningIntent) {
+    return {
+      route: "learning_system_design",
+      label: "学习提升任务",
+      reason: "请求涉及计划、诊断、练习或长期提升，需要主 Agent 分发子 Agent。",
+      confidence: 0.82,
+      planningGoal: text
+    };
+  }
+  if (hasQuestionIntent || text.length < 80) {
+    return {
+      route: "question_answering",
+      label: "知识问答",
+      reason: "请求更像一个具体知识问题，优先由主 Agent 调用 RAG 检索回答。",
+      confidence: hasQuestionIntent ? 0.86 : 0.68,
+      ragQuery: text
+    };
+  }
+  return {
+    route: "learning_system_design",
+    label: "学习提升任务",
+    reason: "输入较开放，按学习系统设计任务处理，交由子 Agent 协作。",
+    confidence: 0.64,
+    planningGoal: text
+  };
+}
+
+async function submitLearningRequest() {
+  if (!state.query.trim()) return;
+  state.routeBusy = true;
+  state.error = "";
+  state.answer = null;
+  state.routeDecision = routeLearningRequest(state.query);
+  try {
+    if (state.routeDecision.route === "clarify") {
+      state.error = state.routeDecision.reason;
+      return;
+    }
+    if (state.routeDecision.route === "question_answering") {
+      await askRag();
+      return;
+    }
+    await startLearningAgentTask();
+  } finally {
+    state.routeBusy = false;
+  }
 }
 
 async function retryDocumentIndex(doc: DocumentItem) {
@@ -490,11 +624,42 @@ async function startAgentReview() {
   }
 }
 
+async function startLearningAgentTask() {
+  const input = [
+    "主 Agent 已判断这是学习提升/系统规划设计任务。",
+    "请围绕用户目标制定计划，并按需分发给 diagnostic_agent、research_agent、practice_agent、coach_agent 等子 Agent。",
+    "",
+    `用户目标：${state.query.trim()}`
+  ].join("\n");
+  state.taskBusy = true;
+  state.error = "";
+  try {
+    const task = await createAgentTask({
+      user_input: input,
+      task_type: "learning_coach",
+      kb_id: state.selectedKbId || undefined,
+      document_id: state.selectedDocId || undefined,
+      conversation_id: state.conversationId || undefined,
+      max_steps: 10,
+      max_tool_calls: 16
+    });
+    await refreshTasks();
+    await refreshEvents(task.task_id);
+    await refreshLearning();
+    connectAgentStream(task.task_id);
+  } catch (error) {
+    state.error = messageFromError(error, "Agent task failed to start.");
+  } finally {
+    state.taskBusy = false;
+  }
+}
+
 async function refreshTasks() {
   state.tasks = (await listAgentTasks()).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   if (state.tasks[0]) {
     await refreshEvents(state.tasks[0].task_id);
     if (isActiveAgentStatus(state.tasks[0].status)) connectAgentStream(state.tasks[0].task_id);
+    if (state.tasks[0].status === "completed") void refreshLearning();
   }
 }
 
@@ -691,6 +856,14 @@ onUnmounted(() => {
             <span><small>引用数量</small><strong>{{ state.answer?.citations.length ?? 0 }}</strong></span>
             <span><small>任务状态</small><strong>{{ activeTask?.status || "idle" }}</strong></span>
           </div>
+          <section class="route-strip" :class="routeTone">
+            <div>
+              <p class="eyebrow">MAIN AGENT ROUTE</p>
+              <h3>{{ routeLabel }}</h3>
+              <p>{{ state.routeDecision?.reason || "输入后由主 Agent 判断：具体问题走 RAG，学习提升/系统规划设计走子 Agent。" }}</p>
+            </div>
+            <span v-if="state.routeDecision">{{ Math.round(state.routeDecision.confidence * 100) }}%</span>
+          </section>
           <p v-if="state.error" class="workspace-error inline-error">{{ state.error }}</p>
 
           <div class="workspace-scroll">
@@ -707,9 +880,13 @@ onUnmounted(() => {
                 <label class="toggle"><input v-model="state.rewriteQuery" type="checkbox" />改写问题</label>
               </div>
               <div class="panel-actions">
-                <button class="primary-button" :disabled="state.busy || !selectedDocCanSearch" @click="askRag">
-                  <LoaderCircle v-if="state.busy" :size="16" class="spin" /><MessageSquareText v-else :size="16" />
-                  {{ state.busy ? "生成中" : "生成面试回答" }}
+                <button class="primary-button" :disabled="state.routeBusy || state.busy || state.taskBusy || !selectedDocCanSearch" @click="submitLearningRequest">
+                  <LoaderCircle v-if="state.routeBusy || state.busy || state.taskBusy" :size="16" class="spin" /><Sparkles v-else :size="16" />
+                  {{ state.routeBusy || state.busy || state.taskBusy ? "执行中" : "开始学习任务" }}
+                </button>
+                <button class="secondary-button" :disabled="state.busy || !selectedDocCanSearch" @click="askRag">
+                  <MessageSquareText :size="16" />
+                  仅 RAG 问答
                 </button>
               </div>
               <p v-if="!selectedDocCanSearch && selectedDocProgress" class="query-hint">当前文档状态为 {{ progressLabel(selectedDocProgress) }}，索引完成后才能按该文档检索。</p>
@@ -717,9 +894,9 @@ onUnmounted(() => {
 
             <section v-if="!state.answer" class="workspace-empty">
               <div class="empty-constellation"><Target :size="28" /><span></span><i></i><i></i></div>
-              <p class="eyebrow">START A DRILL</p>
-              <h2>选择训练模式，围绕你的资料开始追问。</h2>
-              <p>建议先上传岗位 JD、简历项目描述和知识笔记。回答会保留引用，Agent 可以进一步生成提优复盘。</p>
+              <p class="eyebrow">MAIN AGENT READY</p>
+              <h2>输入具体问题，或描述你想提升的学习目标。</h2>
+              <p>具体问题会直接走 RAG 检索答案；学习规划、诊断、练习和复盘会进入子 Agent 协作流程。</p>
             </section>
 
             <section v-else class="answer-layout">
@@ -755,6 +932,28 @@ onUnmounted(() => {
             <div><Gauge :size="15" /><span><small>Tasks</small><strong>{{ state.tasks.length }}</strong></span></div>
             <div><Bot :size="15" /><span><small>Events</small><strong>{{ state.events.length }}</strong></span></div>
           </div>
+          <section class="business-dashboard">
+            <div class="panel-heading compact">
+              <div><p class="eyebrow">BUSINESS VIEW</p><h3>学习闭环指标</h3></div>
+              <button class="icon-button" title="刷新学习指标" :disabled="state.learningBusy" @click="refreshLearning"><RefreshCw :size="14" /></button>
+            </div>
+            <div class="metric-grid">
+              <span><small>14日活跃</small><strong>{{ state.learningDashboard?.active_days_14d ?? 0 }}</strong></span>
+              <span><small>完成任务</small><strong>{{ state.learningDashboard?.tasks_completed_14d ?? 0 }}</strong></span>
+              <span><small>练习正确率</small><strong>{{ Math.round((state.learningDashboard?.practice_accuracy ?? 0) * 100) }}%</strong></span>
+              <span><small>节省人工</small><strong>{{ state.learningDashboard?.agent_saved_minutes ?? 0 }}m</strong></span>
+            </div>
+            <div class="profile-strip">
+              <strong>{{ state.learningProfile?.target_role || "学习目标待诊断" }}</strong>
+              <small>准备度 {{ Math.round((state.learningProfile?.readiness_score ?? 0) * 100) }}% · 待复习 {{ state.learningDashboard?.due_reviews ?? 0 }}</small>
+            </div>
+            <div class="weakness-stack">
+              <article v-for="item in state.weaknesses.slice(0, 3)" :key="item.id">
+                <span>{{ item.topic }}</span>
+                <b><i :style="{ width: `${Math.round(item.severity * 100)}%` }"></i></b>
+              </article>
+            </div>
+          </section>
           <div class="activity-actions">
             <button class="secondary-button" @click="refreshTasks"><RefreshCw :size="14" />刷新事件</button>
             <button v-if="activeTask && ['pending', 'running'].includes(activeTask.status)" class="ghost-button" @click="cancelActiveTask"><XCircle :size="14" />取消</button>
@@ -781,6 +980,19 @@ onUnmounted(() => {
             <CheckCircle2 :size="16" />
             <pre>{{ activeTask.final_answer }}</pre>
           </article>
+          <section class="practice-queue">
+            <div class="panel-heading compact">
+              <div><p class="eyebrow">PRACTICE</p><h3>下一轮练习</h3></div>
+            </div>
+            <article v-for="item in state.practices.slice(0, 3)" :key="item.id">
+              <strong>{{ item.topic }}</strong>
+              <p>{{ item.question }}</p>
+            </article>
+            <article v-if="!state.practices.length" class="empty-mini">
+              <strong>暂无练习</strong>
+              <p>运行一次学习提升任务后会自动生成练习和复习项。</p>
+            </article>
+          </section>
         </aside>
       </div>
     </main>

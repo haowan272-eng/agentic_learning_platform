@@ -23,7 +23,7 @@ from app.agent_runtime.planner import (
     AgentPlan,
     ProposalSection,
     ResearchTask,
-    RouteDecision,
+    SupervisorDecision,
     ToolCallSpec,
     ToolPlanDecision,
     UpgradeProposal,
@@ -43,7 +43,7 @@ from app.agent_runtime.schemas import (
     validate_agent_state,
     validate_node_update,
     validate_research_work_item,
-    validate_router_route,
+    validate_supervisor_route,
     validate_verification_route,
 )
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -254,12 +254,34 @@ class TestHappyPath:
         assert len(store.verifications) >= 1, (
             f"Expected ≥1 verification, got {len(store.verifications)}"
         )
+        assert {call["agent_name"] for call in store.tool_calls} == {"tool_agent"}
+
+    def test_research_agent_uses_tool_request_feedback_contract(self):
+        from langgraph.checkpoint.memory import MemorySaver
+
+        store = FakeStore()
+        state = _make_base_state()
+
+        graph = build_agent_graph(store, checkpointer=MemorySaver())
+        config = {"configurable": {"thread_id": state["task_id"]}}
+
+        for _ in graph.stream(state, config=config, stream_mode="updates"):
+            pass
+
+        final = dict(graph.get_state(config).values)
+        message_kinds = {message["kind"] for message in final.get("messages", [])}
+        event_agents = {event.get("agent_name") for event in store.events}
+
+        assert "tool_request" in message_kinds
+        assert "tool_result" in message_kinds
+        assert "tool_agent" in event_agents
+        assert all(item.get("executor") == "tool_agent" for item in final.get("tool_feedback", {}).values())
 
 
 # ── router path selection E2E ────────────────────────────────────────────────
 
 
-class TestRouterPathSelection:
+class TestSupervisorDelegation:
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         with patch(
@@ -282,16 +304,18 @@ class TestRouterPathSelection:
         state = _make_base_state(task_type="chat", user_input="什么是 RAG？")
 
         with patch(
-            "app.agent_runtime.runtime.generate_route",
+            "app.agent_runtime.runtime.generate_supervisor_decision",
             return_value=(
-                RouteDecision(
-                    target_node="direct_answer",
+                SupervisorDecision(
+                    child_agents=["direct_answer_agent"],
+                    route="direct_answer",
                     intent="direct_chat",
                     reason="simple concept question",
                     confidence=0.9,
                     needs_rag=False,
+                    needs_tools=False,
                     needs_verification=False,
-                    stop_after_node=True,
+                    stop_after_children=True,
                     response_mode="direct",
                 ),
                 "mock",
@@ -308,30 +332,53 @@ class TestRouterPathSelection:
         event_types = {event["event_type"] for event in store.events}
         assert final["status"] == "completed"
         assert final["grounding"]["mode"] == "direct"
-        assert "router.decided" in event_types
+        assert final["supervisor_decision"]["child_agents"] == ["direct_answer_agent"]
+        assert "supervisor.delegated" in event_types
         assert len(store.plans) == 0
         assert len(store.tool_calls) == 0
         assert len(store.verifications) == 0
 
-    def test_rag_route_retrieves_and_finishes_without_architect_or_verifier(self):
+    def test_rag_question_routes_through_tool_agent_without_rag_shortcut(self):
         from langgraph.checkpoint.memory import MemorySaver
 
         store = FakeStore()
         state = _make_base_state(task_type="rag_question", user_input="知识库里有没有 TCP 三次握手？", kb_id=1)
 
         with patch(
-            "app.agent_runtime.runtime.generate_route",
+            "app.agent_runtime.runtime.generate_supervisor_decision",
             return_value=(
-                RouteDecision(
-                    target_node="rag_retrieve",
+                SupervisorDecision(
+                    child_agents=["tool_agent"],
+                    route="tool_planner",
                     intent="rag_question",
-                    reason="knowledge lookup only",
+                    reason="knowledge lookup through tool agent",
                     confidence=0.92,
                     needs_rag=True,
+                    needs_tools=True,
                     needs_verification=False,
-                    stop_after_node=True,
+                    stop_after_children=True,
                     response_mode="rag_answer",
                     query="TCP 三次握手",
+                ),
+                "mock",
+                None,
+            ),
+        ), patch(
+            "app.agent_runtime.runtime.generate_tool_plan",
+            return_value=(
+                ToolPlanDecision(
+                    calls=[
+                        ToolCallSpec(
+                            call_id="tool-rag",
+                            tool_name="knowledge.answer",
+                            arguments={"query": "TCP 三次握手", "top_k": 5},
+                            reason="retrieve grounded answer through tool agent",
+                        )
+                    ],
+                    stop_after_tools=True,
+                    next_node="tool_response",
+                    reason="answer after tool retrieval",
+                    confidence=0.9,
                 ),
                 "mock",
                 None,
@@ -350,7 +397,11 @@ class TestRouterPathSelection:
         event_agents = {event.get("agent_name") for event in store.events}
         assert final["status"] == "completed"
         assert final["grounding"]["rag_used"] is True
-        assert "rag_retrieve" in event_agents
+        assert final["supervisor_decision"]["child_agents"] == ["tool_agent"]
+        assert "rag_retrieve" not in event_agents
+        assert "tool_planner" in event_agents
+        assert "tool_executor" in event_agents
+        assert "tool_response" in event_agents
         assert "architect_agent" not in event_agents
         assert len(store.plans) == 0
         assert len(store.tool_calls) == 1
@@ -363,16 +414,18 @@ class TestRouterPathSelection:
         state = _make_base_state(task_type="rag_question", user_input="根据知识库回答 TCP 三次握手", kb_id=1)
 
         with patch(
-            "app.agent_runtime.runtime.generate_route",
+            "app.agent_runtime.runtime.generate_supervisor_decision",
             return_value=(
-                RouteDecision(
-                    target_node="tool_planner",
+                SupervisorDecision(
+                    child_agents=["tool_agent"],
+                    route="tool_planner",
                     intent="rag_question",
                     reason="needs autonomous tool selection",
                     confidence=0.9,
                     needs_rag=True,
+                    needs_tools=True,
                     needs_verification=False,
-                    stop_after_node=True,
+                    stop_after_children=True,
                     response_mode="rag_answer",
                     query="TCP 三次握手",
                 ),
@@ -412,6 +465,7 @@ class TestRouterPathSelection:
         final = dict(graph.get_state(config).values)
         event_types = {event["event_type"] for event in store.events}
         assert final["status"] == "completed"
+        assert final["supervisor_decision"]["child_agents"] == ["tool_agent"]
         assert final["tool_feedback"]["success_count"] == 1
         assert final["tool_feedback"]["next_node"] == "tool_response"
         assert "tool.plan_created" in event_types
@@ -835,9 +889,41 @@ class TestAgentTaskStateInvariants:
         with pytest.raises(ValidationError):
             validate_verification_route("skip_final")
 
-    def test_pydantic_router_route_boundary_rejects_unknown_target(self):
+    def test_pydantic_supervisor_route_boundary_rejects_unknown_target(self):
         with pytest.raises(ValidationError):
-            validate_router_route("research_agent")
+            validate_supervisor_route("research_agent")
+
+    def test_supervisor_decision_rejects_mismatched_child_agents(self):
+        with pytest.raises(ValidationError):
+            SupervisorDecision(
+                child_agents=["tool_agent"],
+                route="direct_answer",
+                intent="direct_chat",
+                reason="invalid mixed route",
+                confidence=0.9,
+                needs_rag=False,
+                needs_tools=False,
+                needs_verification=False,
+                stop_after_children=True,
+                response_mode="direct",
+            )
+
+    def test_supervisor_decision_accepts_tool_agent_route_contract(self):
+        decision = SupervisorDecision(
+            child_agents=["tool_agent"],
+            route="tool_planner",
+            intent="rag_question",
+            reason="valid tool agent route",
+            confidence=0.9,
+            needs_rag=True,
+            needs_tools=True,
+            needs_verification=False,
+            stop_after_children=True,
+            response_mode="rag_answer",
+            query="TCP handshake",
+        )
+
+        assert decision.child_agents == ["tool_agent"]
 
     def test_minimal_state_is_accepted_by_graph_builder(self):
         from langgraph.checkpoint.memory import MemorySaver

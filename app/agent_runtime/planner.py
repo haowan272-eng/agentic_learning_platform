@@ -6,13 +6,13 @@ import time
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from app.core.config import AGENT_PLANNER_CANDIDATE_COUNT
 
 from .llm_gateway import TokenCallback, llm_gateway
 from .prompt_registry import ABMetric, prompt_registry
-from .schemas import RouterRoute
+from .schemas import ChildAgent, SupervisorRoute
 
 logger = logging.getLogger(__name__)
 
@@ -37,16 +37,37 @@ class PlanSelection(BaseModel):
     rationale: str = Field(..., min_length=1, max_length=500)
 
 
-class RouteDecision(BaseModel):
-    target_node: RouterRoute
+class SupervisorDecision(BaseModel):
+    child_agents: list[ChildAgent] = Field(..., min_length=1, max_length=5)
+    route: SupervisorRoute
     intent: str = Field(..., min_length=1, max_length=128)
     reason: str = Field(..., min_length=1, max_length=1000)
     confidence: float = Field(ge=0, le=1)
     needs_rag: bool
+    needs_tools: bool
     needs_verification: bool
-    stop_after_node: bool
+    stop_after_children: bool
     response_mode: Literal["direct", "rag_answer", "draft", "verified_plan", "fallback"]
     query: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_route_consistency(self) -> "SupervisorDecision":
+        expected_agents = _child_agents_for_route(
+            self.route,
+            needs_verification=self.needs_verification,
+        )
+        if self.child_agents != expected_agents:
+            raise ValueError(
+                f"child_agents must be {expected_agents!r} when route={self.route!r} "
+                f"and needs_verification={self.needs_verification!r}."
+            )
+        if self.route == "direct_answer" and (self.needs_tools or self.needs_rag or self.needs_verification):
+            raise ValueError("direct_answer cannot require tools, RAG, or verification.")
+        if self.route == "tool_planner" and not self.needs_tools:
+            raise ValueError("tool_planner must set needs_tools=true.")
+        if self.route == "supervisor_plan" and not self.needs_verification:
+            raise ValueError("supervisor_plan must set needs_verification=true.")
+        return self
 
 
 class ToolCallSpec(BaseModel):
@@ -111,67 +132,104 @@ def default_plan(state: dict[str, Any]) -> AgentPlan:
 # Extracted to module-level constants for easier iteration and testing.
 
 
-def default_route_decision(state: dict[str, Any], *, reason: str | None = None) -> RouteDecision:
+def _child_agents_for_route(route: SupervisorRoute, *, needs_verification: bool) -> list[ChildAgent]:
+    if route == "direct_answer":
+        return ["direct_answer_agent"]
+    if route == "tool_planner":
+        return ["tool_agent"]
+    if route == "architect_agent":
+        agents: list[ChildAgent] = ["architect_agent"]
+        if needs_verification:
+            agents.append("verifier_agent")
+        return agents
+    if route == "verifier_agent":
+        return ["verifier_agent"]
+    if route == "supervisor_plan":
+        return ["research_agent", "architect_agent", "verifier_agent"]
+    if route == "learning_coach":
+        return ["diagnostic_agent", "practice_agent", "coach_agent"]
+    if route == "final_response":
+        return ["architect_agent", "verifier_agent"] if needs_verification else ["architect_agent"]
+    return ["direct_answer_agent"]
+
+
+def default_supervisor_decision(state: dict[str, Any], *, reason: str | None = None) -> SupervisorDecision:
     user_input = str(state.get("user_input") or "").strip()
     task_type = str(state.get("task_type") or "").lower()
     text = user_input.lower()
     has_rag_scope = bool(state.get("kb_id") or state.get("document_id") or state.get("conversation_id"))
     heavy_terms = (
-        "面试", "提优", "提升", "学习计划", "学习提升", "方案", "规划", "设计", "架构",
-        "重构", "工程化", "评估", "诊断", "复盘", "简历", "岗位", "agent", "rag",
+        "面试", "提优", "提升", "学习计划", "学习提升", "学习路线", "学习路径", "方案", "规划",
+        "计划", "设计", "架构", "重构", "工程化", "评估", "诊断", "薄弱", "练习", "训练",
+        "模拟", "复盘", "批改", "评价", "准备", "安排", "制定", "简历", "岗位", "agent", "rag",
     )
-    rag_terms = ("知识库", "文档", "资料", "有没有", "查", "检索", "引用", "根据", "材料")
-    direct_terms = ("是什么", "解释", "什么意思", "区别", "怎么理解", "hello", "你好")
+    rag_terms = ("知识库", "文档", "资料", "有没有", "查", "检索", "引用", "根据", "材料", "是什么", "为什么", "区别", "原理", "？", "解释", "对比", "举例", "怎么理解")
+    direct_terms = ("是什么", "解释", "什么意思", "区别", "怎么理解", "你好", "谢谢", "早上好", "好的", "hello", "hi", "在吗")
 
-    if any(term in task_type for term in ("project", "upgrade", "improvement", "interview")) or any(term in text for term in heavy_terms):
-        return RouteDecision(
-            target_node="supervisor_plan",
-            intent=str(state.get("task_type") or "interview_improvement"),
-            reason=reason or "任务需要拆解、检索、生成方案与质量校验，进入完整多 Agent 提优链路。",
-            confidence=0.72,
-            needs_rag=True,
-            needs_verification=True,
-            stop_after_node=False,
-            response_mode="verified_plan",
-            query=user_input,
-        )
+    if any(term in task_type for term in ("learning_coach", "diagnostic", "practice", "coach")):
+        route = "learning_coach"
+        intent = "learning_coach"
+        confidence = 0.82
+        needs_rag = has_rag_scope
+        needs_verification = False
+        stop_after_children = True
+        response_mode = "verified_plan"
+        query = user_input
+        fallback_reason = "学习提升任务走诊断、练习、教练短链路。"
+    elif any(term in task_type for term in ("project", "upgrade", "improvement", "interview")) or any(term in text for term in heavy_terms):
+        route: SupervisorRoute = "supervisor_plan"
+        intent = str(state.get("task_type") or "interview_improvement")
+        confidence = 0.72
+        needs_rag = True
+        needs_verification = True
+        stop_after_children = False
+        response_mode: Literal["direct", "rag_answer", "draft", "verified_plan", "fallback"] = "verified_plan"
+        query = user_input
+        fallback_reason = "请求涉及规划、诊断、练习或长期提升，需要进入多 Agent 方案链路。"
+    elif has_rag_scope or any(term in text for term in rag_terms):
+        route = "tool_planner"
+        intent = "rag_question"
+        confidence = 0.68
+        needs_rag = True
+        needs_verification = False
+        stop_after_children = True
+        response_mode = "rag_answer"
+        query = user_input
+        fallback_reason = "请求包含知识库上下文或具体资料问题，交给 Tool Agent 做检索问答。"
+    elif len(user_input) <= 160 or any(term in text for term in direct_terms):
+        route = "direct_answer"
+        intent = "direct_chat"
+        confidence = 0.62
+        needs_rag = False
+        needs_verification = False
+        stop_after_children = True
+        response_mode = "direct"
+        query = None
+        fallback_reason = "请求较轻量或偏闲聊，无需调用 RAG 或多 Agent 链路。"
+    else:
+        route = "supervisor_plan"
+        intent = str(state.get("task_type") or "interview_improvement")
+        confidence = 0.55
+        needs_rag = True
+        needs_verification = True
+        stop_after_children = False
+        response_mode = "verified_plan"
+        query = user_input
+        fallback_reason = "输入较开放，按学习提升或方案设计任务进入多 Agent 链路。"
 
-    if has_rag_scope or any(term in text for term in rag_terms):
-        return RouteDecision(
-            target_node="tool_planner",
-            intent="rag_question",
-            reason=reason or "用户主要需要基于知识库或文档材料回答，交给 Tool Planner 自主选择工具。",
-            confidence=0.68,
-            needs_rag=True,
-            needs_verification=False,
-            stop_after_node=True,
-            response_mode="rag_answer",
-            query=user_input,
-        )
-
-    if len(user_input) <= 160 or any(term in text for term in direct_terms):
-        return RouteDecision(
-            target_node="direct_answer",
-            intent="direct_chat",
-            reason=reason or "问题可以轻量回答，不需要 RAG 检索或多 Agent 编排。",
-            confidence=0.62,
-            needs_rag=False,
-            needs_verification=False,
-            stop_after_node=True,
-            response_mode="direct",
-            query=None,
-        )
-
-    return RouteDecision(
-        target_node="supervisor_plan",
-        intent=str(state.get("task_type") or "interview_improvement"),
-        reason=reason or "任务边界不够简单，保守进入完整多 Agent 提优链路。",
-        confidence=0.55,
-        needs_rag=True,
-        needs_verification=True,
-        stop_after_node=False,
-        response_mode="verified_plan",
-        query=user_input,
+    needs_tools = route == "tool_planner" or needs_rag
+    return SupervisorDecision(
+        child_agents=_child_agents_for_route(route, needs_verification=needs_verification),
+        route=route,
+        intent=intent,
+        reason=reason or fallback_reason,
+        confidence=confidence,
+        needs_rag=needs_rag,
+        needs_tools=needs_tools,
+        needs_verification=needs_verification,
+        stop_after_children=stop_after_children,
+        response_mode=response_mode,
+        query=query,
     )
 
 
@@ -227,16 +285,20 @@ def _render_prompt(name: str, variables: dict[str, Any], *, role: str = "planner
     return result.text
 
 
-def _router_prompt(state: dict[str, Any]) -> str:
-    return _render_prompt("llm_router", {
+def _supervisor_agent_prompt(state: dict[str, Any]) -> str:
+    return _render_prompt("supervisor_agent", {
         "user_input": state.get("user_input", ""),
         "task_type": state.get("task_type", "interview_improvement"),
         "memory_context": state.get("memory_context", {}),
         "has_rag_scope": bool(state.get("kb_id") or state.get("document_id") or state.get("conversation_id")),
         "existing_artifact_count": len(state.get("artifacts", []) or []),
         "has_proposal": bool(state.get("proposal")),
-        "allowed_targets": [
-            "direct_answer", "rag_retrieve", "tool_planner", "supervisor_plan", "architect_agent",
+        "allowed_child_agents": [
+            "direct_answer_agent", "tool_agent", "research_agent", "architect_agent", "verifier_agent",
+            "diagnostic_agent", "practice_agent", "coach_agent",
+        ],
+        "allowed_routes": [
+            "direct_answer", "tool_planner", "supervisor_plan", "learning_coach", "architect_agent",
             "verifier_agent", "final_response", "fallback_response",
         ],
     }, role="planner", state=state)
@@ -373,19 +435,19 @@ def _invoke_structured(
 # ── Public orchestration entry points ─────────────────────────────────
 
 
-def generate_route(
+def generate_supervisor_decision(
     state: dict[str, Any], *, on_token: TokenCallback | None = None,
-) -> tuple[RouteDecision, str, str | None]:
+) -> tuple[SupervisorDecision, str, str | None]:
     try:
         decision, source, _ptk, _ctk = _invoke_structured(
-            "planner", _router_prompt(state), RouteDecision, on_token,
-            template_name="llm_router", task_id=str(state.get("task_id", "")),
+            "planner", _supervisor_agent_prompt(state), SupervisorDecision, on_token,
+            template_name="supervisor_agent", task_id=str(state.get("task_id", "")),
         )
         return decision, source, None  # type: ignore[return-value]
     except Exception as exc:  # noqa: BLE001
-        error = f"Router LLM call failed; applied deterministic route: {exc}"
+        error = f"Supervisor Agent LLM call failed; applied deterministic delegation: {exc}"
         logger.warning(error)
-        return default_route_decision(state, reason=error), "fallback", error
+        return default_supervisor_decision(state, reason=error), "fallback", error
 
 
 def generate_tool_plan(

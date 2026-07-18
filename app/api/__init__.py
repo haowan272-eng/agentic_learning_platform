@@ -10,6 +10,7 @@ from .memory import router as memory_router
 from .health import router as health_router
 from .agent import router as agent_router
 from .metrics import router as metrics_router
+from .learning import router as learning_router
 
 api_router = APIRouter()
 api_router.include_router(auth_router)
@@ -22,3 +23,4 @@ api_router.include_router(memory_router)
 api_router.include_router(health_router)
 api_router.include_router(agent_router)
 api_router.include_router(metrics_router)
+api_router.include_router(learning_router)

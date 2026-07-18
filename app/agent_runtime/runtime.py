@@ -7,12 +7,14 @@ from uuid import uuid4
 
 from app.agent_runtime.event_bus import publish_task_event
 from app.core.config import DATABASE_URL, LANGGRAPH_CHECKPOINT_SETUP
+from app.core.database import SessionLocal
 from app.memory.service import build_context_for_state, consolidate_task_memory, record_memory_event, summarize_task_session
 from app.memory.short_term import append_recent_event
 from app.observability import increment
+from app.services.learning_service import record_agent_learning_outputs
 
 from .llm_gateway import llm_gateway
-from .planner import AgentPlan, ResearchTask, generate_plan, generate_proposal, generate_route, generate_tool_plan, verify_proposal
+from .planner import AgentPlan, ResearchTask, generate_plan, generate_proposal, generate_supervisor_decision, generate_tool_plan, verify_proposal
 from .schemas import (
     AgentEvent,
     AgentMessage,
@@ -26,7 +28,7 @@ from .schemas import (
     validate_node_update,
     validate_plan_route,
     validate_research_work_item,
-    validate_router_route,
+    validate_supervisor_route,
     validate_tool_executor_route,
     validate_verification_route,
 )
@@ -126,20 +128,39 @@ def _enforce_policy(state: dict[str, Any], store: RuntimeStore) -> None:
             pass
 
 
-def _llm_router(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+def _supervisor_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
     state = validate_agent_state(state)
-    decision, source, error = generate_route(state, on_token=_llm_token_callback(state, "llm_router"))
-    route_payload = decision.model_dump(mode="json")
+    decision, source, error = generate_supervisor_decision(
+        state,
+        on_token=_llm_token_callback(state, "supervisor_agent"),
+    )
+    supervisor_payload = decision.model_dump(mode="json")
+    route_payload = {
+        "target_node": decision.route,
+        "intent": decision.intent,
+        "reason": decision.reason,
+        "confidence": decision.confidence,
+        "needs_rag": decision.needs_rag,
+        "needs_tools": decision.needs_tools,
+        "needs_verification": decision.needs_verification,
+        "stop_after_node": decision.stop_after_children,
+        "response_mode": decision.response_mode,
+        "query": decision.query,
+        "child_agents": supervisor_payload.get("child_agents") or [],
+    }
     event = _event(
         state,
         store,
-        "router.decided",
-        f"Router selected {decision.target_node}.",
-        agent_name="llm_router",
-        payload={"source": source, "decision": route_payload, "error": error},
+        "supervisor.delegated",
+        f"Supervisor delegated to {', '.join(supervisor_payload.get('child_agents') or [])}.",
+        agent_name="supervisor_agent",
+        payload={"source": source, "decision": supervisor_payload, "route_decision": route_payload, "error": error},
     )
     return validate_node_update({
         "intent": decision.intent,
+        "supervisor_decision": supervisor_payload,
+        "supervisor_source": source,
+        "supervisor_error": error,
         "route_decision": route_payload,
         "route_source": source,
         "route_error": error,
@@ -148,11 +169,10 @@ def _llm_router(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
     })
 
 
-def _router_route(state: AgentTaskState) -> str:
+def _supervisor_route(state: AgentTaskState) -> str:
     state = validate_agent_state(state)
-    decision = state.get("route_decision") or {}
-    target = str(decision.get("target_node") or "supervisor_plan")
-    return validate_router_route(target)
+    decision = state.get("supervisor_decision") or {}
+    return validate_supervisor_route(str(decision.get("route") or "supervisor_plan"))
 
 
 def _direct_answer(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
@@ -189,48 +209,6 @@ def _direct_answer(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]
         "grounding": {"mode": "direct", "rag_used": False},
         "emitted_events": [event],
     })
-
-
-def _rag_retrieve(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
-    state = validate_agent_state(state)
-    decision = state.get("route_decision") or {}
-    query = str(decision.get("query") or state.get("user_input") or "")
-    start = _event(state, store, "agent.started", "Router dispatched a lightweight RAG retrieval.", agent_name="rag_retrieve", payload={"query": query})
-    execution = execute_managed_tool(
-        state,
-        store,
-        tool_name="knowledge.answer",
-        arguments={"query": query, "top_k": 5, "use_memory": True, "rewrite_query": True},
-        agent_name="research_agent",
-        skill_name="knowledge_grounding",
-        step_id="rag_retrieve",
-    )
-    result = execution.result
-    artifact = {**execution.artifact, "producer": "rag_retrieve"}
-    answer = str((result.get("data") or {}).get("answer") or "")
-    if not answer:
-        answer = "当前没有检索到足够的知识库内容。请先上传并完成索引，或换一个更具体的问题。"
-    done = _event(
-        state,
-        store,
-        "task.completed" if result.get("ok") else "agent.failed",
-        "Lightweight RAG retrieval completed.",
-        agent_name="rag_retrieve",
-        tool_name="knowledge.answer",
-        step_id="rag_retrieve",
-        payload={"artifact_id": artifact["artifact_id"], "ok": bool(result.get("ok"))},
-    )
-    update: dict[str, Any] = {
-        "status": "completed",
-        "final_answer": answer,
-        "citations": result.get("citations") or [],
-        "grounding": result.get("grounding") or {"mode": "rag_answer", "rag_used": True},
-        "artifacts": [artifact],
-        "emitted_events": [start, done],
-    }
-    if result.get("error"):
-        update["errors"] = [{"source": "rag_retrieve", "error_type": (result.get("error") or {}).get("type", "rag_failed"), "message": (result.get("error") or {}).get("message", "RAG retrieval failed."), "retryable": bool((result.get("error") or {}).get("retryable", True)), "correlation_id": "rag_retrieve"}]
-    return validate_node_update(update)
 
 
 def _tool_planner(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
@@ -271,7 +249,7 @@ def _tool_executor(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]
             store,
             tool_name=tool_name,
             arguments=arguments,
-            agent_name="executor",
+            agent_name="tool_agent",
             skill_name="autonomous_tool_use",
             step_id=call_id,
             call_id=call_id,
@@ -301,7 +279,7 @@ def _tool_executor(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]
                 store,
                 tool_name="knowledge.repair_retrieval",
                 arguments={**arguments, "repair_reason": error.get("type") or "retrieval_insufficient"},
-                agent_name="executor",
+                agent_name="tool_agent",
                 skill_name="autonomous_tool_use",
                 step_id=repair_id,
                 call_id=repair_id,
@@ -371,6 +349,103 @@ def _tool_response(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]
         "final_answer": answer,
         "citations": citations,
         "grounding": grounding or {"mode": "tool_response", "rag_used": bool(citations)},
+        "emitted_events": [event],
+    })
+
+
+def _diagnostic_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
+    user_input = str(state.get("user_input") or "").strip()
+    topics = []
+    for keyword in ["系统设计", "项目表达", "RAG", "Agent", "数据库", "缓存", "索引", "面试"]:
+        if keyword.lower() in user_input.lower():
+            topics.append(keyword)
+    if not topics:
+        topics = ["学习目标澄清", "知识结构", "表达闭环"]
+    diagnosis = {
+        "goal": user_input,
+        "target_role": "面试提优" if "面试" in user_input else "学习提升",
+        "current_level": "needs_diagnostic",
+        "weaknesses": [
+            {"topic": topic, "severity": round(0.72 - index * 0.1, 2), "category": "interview" if topic in {"项目表达", "面试"} else "knowledge"}
+            for index, topic in enumerate(topics[:3])
+        ],
+        "success_criteria": ["能用项目证据回答", "能解释关键取舍", "能完成追问复盘"],
+    }
+    artifact: Artifact = {
+        "artifact_id": f"diagnostic-{uuid4().hex[:12]}",
+        "kind": "learning_diagnostic",
+        "producer": "diagnostic_agent",
+        "correlation_id": "diagnostic",
+        "data": diagnosis,
+        "citations": [],
+        "confidence": 0.72,
+        "error": None,
+    }
+    event = _event(state, store, "agent.completed", "Diagnostic Agent created a learning profile and weakness map.", agent_name="diagnostic_agent", payload={"artifact_id": artifact["artifact_id"], "weakness_count": len(diagnosis["weaknesses"])})
+    _record_memory_event(state, event_type="learning_diagnostic", category="learning_goal", content=user_input[:1200], metadata={"weaknesses": diagnosis["weaknesses"]})
+    return validate_node_update({"artifacts": [artifact], "memory_context": {"learning_diagnostic": diagnosis}, "emitted_events": [event]})
+
+
+def _practice_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
+    diagnostic = next((item for item in reversed(state.get("artifacts") or []) if item.get("kind") == "learning_diagnostic"), {})
+    weaknesses = ((diagnostic.get("data") or {}).get("weaknesses") or [])[:3]
+    practices = []
+    for item in weaknesses or [{"topic": "学习目标澄清", "severity": 0.5}]:
+        topic = str(item.get("topic") or "学习目标澄清")
+        practices.append({
+            "topic": topic,
+            "difficulty": "hard" if float(item.get("severity") or 0.5) >= 0.65 else "medium",
+            "question": f"围绕「{topic}」做一次面试式回答：先讲核心概念，再讲项目证据，最后讲风险和改进。",
+            "expected_answer": "包含概念、证据、取舍、风险、追问准备。",
+        })
+    artifact: Artifact = {
+        "artifact_id": f"practice-{uuid4().hex[:12]}",
+        "kind": "learning_practice_plan",
+        "producer": "practice_agent",
+        "correlation_id": "practice",
+        "data": {"practices": practices},
+        "citations": [],
+        "confidence": 0.74,
+        "error": None,
+    }
+    event = _event(state, store, "agent.completed", "Practice Agent generated targeted exercises.", agent_name="practice_agent", payload={"artifact_id": artifact["artifact_id"], "practice_count": len(practices)})
+    return validate_node_update({"artifacts": [artifact], "emitted_events": [event]})
+
+
+def _coach_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    state = validate_agent_state(state)
+    diagnostic = next((item for item in reversed(state.get("artifacts") or []) if item.get("kind") == "learning_diagnostic"), {})
+    practice_plan = next((item for item in reversed(state.get("artifacts") or []) if item.get("kind") == "learning_practice_plan"), {})
+    weaknesses = ((diagnostic.get("data") or {}).get("weaknesses") or [])[:3]
+    practices = ((practice_plan.get("data") or {}).get("practices") or [])[:3]
+    lines = [
+        "# 学习提优短链路结果",
+        "",
+        "## 诊断",
+        f"- 目标：{(diagnostic.get('data') or {}).get('goal') or state.get('user_input')}",
+        *[f"- 薄弱点：{item.get('topic')}，优先级 {item.get('severity')}" for item in weaknesses],
+        "",
+        "## 练习",
+        *[f"- {item.get('question')}" for item in practices],
+        "",
+        "## 教练建议",
+        "- 今天先完成 1 道高优先级练习，并把回答压缩到 3 分钟。",
+        "- 每次回答后记录一个证据、一个风险、一个可被追问的问题。",
+        "- 未来 3 天按复习项回看薄弱点，优先补齐项目证据。",
+    ]
+    final_answer = "\n".join(lines)
+    try:
+        with SessionLocal() as db:
+            record_agent_learning_outputs(db, {**state, "citations": state.get("citations") or []}, final_answer)
+    except Exception:  # noqa: BLE001
+        pass
+    event = _event(state, store, "task.completed", "Coach Agent persisted learning profile, practice, and review items.", agent_name="coach_agent", payload={"practice_count": len(practices), "weakness_count": len(weaknesses)})
+    return validate_node_update({
+        "status": "completed",
+        "final_answer": final_answer,
+        "grounding": {"mode": "learning_coach", "rag_used": False},
         "emitted_events": [event],
     })
 
@@ -470,22 +545,79 @@ def _research_agent(work: ResearchWorkItem, store: RuntimeStore) -> dict[str, An
             "emitted_events": [event],
         })
     start = _event(work, store, "agent.started", work["objective"], agent_name="research_agent", payload={"correlation_id": work["correlation_id"]})
+    tool_arguments = {"query": work["query"], "top_k": work.get("top_k", 5), "use_memory": True, "rewrite_query": True}
+    tool_request: AgentMessage = {
+        "message_id": str(uuid4()),
+        "from_agent": "research_agent",
+        "to_agent": "tool_agent",
+        "kind": "tool_request",
+        "correlation_id": work["correlation_id"],
+        "payload": {
+            "tool_name": "knowledge.answer",
+            "arguments": tool_arguments,
+            "reason": work["objective"],
+        },
+    }
+    requested = _event(
+        work,
+        store,
+        "tool.requested",
+        "Research Agent requested evidence retrieval from Tool Agent.",
+        agent_name="research_agent",
+        tool_name="knowledge.answer",
+        step_id=work["correlation_id"],
+        payload={"request": tool_request},
+    )
     execution = execute_managed_tool(
         work,
         store,
         tool_name="knowledge.answer",
-        arguments={"query": work["query"], "top_k": work.get("top_k", 5), "use_memory": True, "rewrite_query": True},
-        agent_name="research_agent",
+        arguments=tool_arguments,
+        agent_name="tool_agent",
         skill_name="knowledge_grounding",
         step_id=work["correlation_id"],
     )
     result = execution.result
     artifact: Artifact = execution.artifact
-    done = _event(work, store, "agent.completed" if result.get("ok") else "agent.failed", "Research Agent finished.", agent_name="research_agent", tool_name="knowledge.answer", step_id=work["correlation_id"], payload={"artifact_id": artifact["artifact_id"], "ok": bool(result.get("ok"))})
+    feedback_item = {
+        "requester": "research_agent",
+        "executor": "tool_agent",
+        "call_id": execution.call_id,
+        "tool_name": execution.tool_name,
+        "ok": bool(result.get("ok")),
+        "artifact_id": artifact["artifact_id"],
+        "confidence": float(result.get("confidence") or 0),
+        "grounding": result.get("grounding") or {},
+        "error": result.get("error"),
+    }
+    tool_done = _event(
+        work,
+        store,
+        "tool.completed" if result.get("ok") else "tool.failed",
+        "Tool Agent completed Research Agent tool request.",
+        agent_name="tool_agent",
+        tool_name="knowledge.answer",
+        step_id=work["correlation_id"],
+        payload=feedback_item,
+    )
+    done = _event(work, store, "agent.completed" if result.get("ok") else "agent.failed", "Research Agent received Tool Agent feedback.", agent_name="research_agent", tool_name="knowledge.answer", step_id=work["correlation_id"], payload={"artifact_id": artifact["artifact_id"], "ok": bool(result.get("ok")), "tool_feedback": feedback_item})
     message: AgentMessage = {"message_id": str(uuid4()), "from_agent": "research_agent", "to_agent": "architect_agent", "kind": "result", "correlation_id": work["correlation_id"], "payload": {"artifact_id": artifact["artifact_id"]}}
-    updates: dict[str, Any] = {"artifacts": [artifact], "messages": [message], "emitted_events": [start, done]}
+    tool_result_message: AgentMessage = {
+        "message_id": str(uuid4()),
+        "from_agent": "tool_agent",
+        "to_agent": "research_agent",
+        "kind": "tool_result",
+        "correlation_id": work["correlation_id"],
+        "payload": feedback_item,
+    }
+    updates: dict[str, Any] = {
+        "artifacts": [artifact],
+        "messages": [tool_request, tool_result_message, message],
+        "tool_feedback": {work["correlation_id"]: feedback_item},
+        "emitted_events": [start, requested, tool_done, done],
+    }
     if result.get("error"):
-        updates["errors"] = [{"source": "research_agent", "error_type": (result.get("error") or {}).get("type", "research_failed"), "message": (result.get("error") or {}).get("message", "Research failed."), "retryable": bool((result.get("error") or {}).get("retryable", True)), "correlation_id": work["correlation_id"]}]
+        updates["errors"] = [{"source": "tool_agent", "error_type": (result.get("error") or {}).get("type", "research_tool_failed"), "message": (result.get("error") or {}).get("message", "Research tool request failed."), "retryable": bool((result.get("error") or {}).get("retryable", True)), "correlation_id": work["correlation_id"]}]
     return validate_node_update(updates)
 
 
@@ -590,12 +722,14 @@ def build_agent_graph(store: RuntimeStore, *, checkpointer: Any) -> Any:
     if StateGraph is None:
         raise RuntimeError(f"langgraph is required for Agent Runtime: {LANGGRAPH_IMPORT_ERROR}")
     builder = StateGraph(AgentTaskState)
-    builder.add_node("llm_router", lambda state: _llm_router(state, store))
+    builder.add_node("supervisor_agent", lambda state: _supervisor_agent(state, store))
     builder.add_node("direct_answer", lambda state: _direct_answer(state, store))
-    builder.add_node("rag_retrieve", lambda state: _rag_retrieve(state, store))
     builder.add_node("tool_planner", lambda state: _tool_planner(state, store))
     builder.add_node("tool_executor", lambda state: _tool_executor(state, store))
     builder.add_node("tool_response", lambda state: _tool_response(state, store))
+    builder.add_node("diagnostic_agent", lambda state: _diagnostic_agent(state, store))
+    builder.add_node("practice_agent", lambda state: _practice_agent(state, store))
+    builder.add_node("coach_agent", lambda state: _coach_agent(state, store))
     builder.add_node("supervisor_plan", lambda state: _supervisor_plan(state, store))
     builder.add_node("approval_gate", lambda state: _approval_gate(state, store))
     builder.add_node("dispatch_research", lambda state: state)
@@ -605,12 +739,12 @@ def build_agent_graph(store: RuntimeStore, *, checkpointer: Any) -> Any:
     builder.add_node("repair_plan", lambda state: _repair_plan(state, store))
     builder.add_node("final_response", lambda state: _final_response(state, store))
     builder.add_node("fallback_response", lambda state: _fallback_response(state, store))
-    builder.add_edge(START, "llm_router")
-    builder.add_conditional_edges("llm_router", _router_route, {
+    builder.add_edge(START, "supervisor_agent")
+    builder.add_conditional_edges("supervisor_agent", _supervisor_route, {
         "direct_answer": "direct_answer",
-        "rag_retrieve": "rag_retrieve",
         "tool_planner": "tool_planner",
         "supervisor_plan": "supervisor_plan",
+        "learning_coach": "diagnostic_agent",
         "architect_agent": "architect_agent",
         "verifier_agent": "verifier_agent",
         "final_response": "final_response",
@@ -618,6 +752,8 @@ def build_agent_graph(store: RuntimeStore, *, checkpointer: Any) -> Any:
     })
     builder.add_edge("tool_planner", "tool_executor")
     builder.add_conditional_edges("tool_executor", _tool_executor_route, {"tool_response": "tool_response", "architect_agent": "architect_agent", "verifier_agent": "verifier_agent", "fallback_response": "fallback_response"})
+    builder.add_edge("diagnostic_agent", "practice_agent")
+    builder.add_edge("practice_agent", "coach_agent")
     builder.add_conditional_edges("supervisor_plan", _plan_route, {"approval_gate": "approval_gate", "dispatch_research": "dispatch_research"})
     # Dynamically fan-out research tasks via Send; Architect runs as a fan-in
     # barrier once every dispatched Research Agent has completed.
@@ -627,8 +763,8 @@ def build_agent_graph(store: RuntimeStore, *, checkpointer: Any) -> Any:
     builder.add_conditional_edges("verifier_agent", _verification_route, {"final_response": "final_response", "repair_plan": "repair_plan", "approval_gate": "approval_gate", "fallback_response": "fallback_response"})
     builder.add_edge("repair_plan", "dispatch_research")
     builder.add_edge("direct_answer", END)
-    builder.add_edge("rag_retrieve", END)
     builder.add_edge("tool_response", END)
+    builder.add_edge("coach_agent", END)
     builder.add_edge("final_response", END)
     builder.add_edge("fallback_response", END)
     return builder.compile(checkpointer=checkpointer)
