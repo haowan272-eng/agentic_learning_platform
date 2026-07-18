@@ -17,20 +17,19 @@ ALLOWED_TOOLS_BY_AGENT: dict[str, frozenset[str]] = {
         "memory.consolidate",
         "memory.summarize_session",
     }),
-    "research_agent": frozenset({"knowledge.answer", "knowledge.repair_retrieval"}),
-    # Architect Agent is an LLM subgraph, not a static pseudo-tool.
-    "architect_agent": frozenset(),
-    "verifier_agent": frozenset({"knowledge.verify_claim"}),
-    "executor": frozenset({
+    "research_agent": frozenset(),
+    "tool_agent": frozenset({
         "memory.read_profile",
         "memory.read_context",
-        "memory.write_event",
-        "memory.consolidate",
-        "memory.summarize_session",
+        "github.search_repositories",
+        "github.read_readme",
         "knowledge.answer",
         "knowledge.repair_retrieval",
         "knowledge.verify_claim",
     }),
+    # Architect Agent is an LLM subgraph, not a static pseudo-tool.
+    "architect_agent": frozenset(),
+    "verifier_agent": frozenset({"knowledge.verify_claim"}),
 }
 
 
