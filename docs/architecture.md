@@ -79,6 +79,44 @@ behind the Tool Registry permission model.
    lessons into `skills/generated/<skill>/SKILL.md`, recording usage,
    provenance, and version snapshots under `.agentic_learning_rag/skill-evolution/`.
 
+## Agent Runtime Routes
+
+The Agent Runtime exposes two top-level task routes only. `supervisor_agent` is
+a pure router: it creates neither answers nor tool calls.
+
+```mermaid
+flowchart TD
+    user["User task"] --> supervisor["supervisor_agent"]
+    supervisor --> route{"answer or research"}
+    route -->|answer| answer["answer_agent"]
+    answer --> final["final_response"]
+    route -->|research| planner["planner_agent"]
+    planner --> approval{"approval required"}
+    approval -->|no| research["research_agent"]
+    approval -->|yes| gate["approval_gate"]
+    gate -->|approve| research
+    gate -->|edit| planner
+    gate -->|reject| fallback["fallback_response"]
+    research --> result{"result"}
+    result -->|deliverable| review["review_agent"]
+    result -->|needs confirmation| gate
+    result -->|insufficient evidence or failure| fallback
+    review -->|approved| final
+    review -->|needs confirmation| gate
+    review -->|rejected| fallback
+    final --> end["End"]
+    fallback --> end
+```
+
+`answer_agent` may answer from model knowledge or use its registered RAG, web,
+GitHub, and claim-verification tools. It can only proceed to `final_response`
+or `fallback_response`; it cannot upgrade into research. `planner_agent` only
+creates an executable plan, and `research_agent` owns multi-step evidence,
+proposal, verification, and repair work. `review_agent` is the final
+publication gate: it reads research state but has no tool permissions and can
+only approve publication, request confirmation, or reject to fallback. All
+other graph nodes have no tool permissions.
+
 ## Common Commands
 
 ```powershell

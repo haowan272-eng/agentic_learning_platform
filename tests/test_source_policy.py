@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from deerflow.planner import ResearchSourceDecision, default_tool_agent_decision, generate_research_source_decision
+from deerflow.planner import ResearchSourceDecision, default_answer_agent_decision, generate_research_source_decision
 from deerflow.source_policy import resolve_source_policy
 
 
@@ -17,7 +17,7 @@ def test_source_policy_defaults_to_auto_and_supports_local_only_intent():
 
 
 def test_auto_source_policy_selects_local_and_web_evidence():
-    decision = default_tool_agent_decision(
+    decision = default_answer_agent_decision(
         {"user_input": "Compare LangGraph and AutoGen", "source_policy": "auto"},
         available_tools=AVAILABLE_TOOLS,
     )
@@ -29,7 +29,7 @@ def test_auto_source_policy_selects_local_and_web_evidence():
 
 
 def test_local_only_source_policy_excludes_public_web_search():
-    decision = default_tool_agent_decision(
+    decision = default_answer_agent_decision(
         {"user_input": "仅参考本地知识库解释 RAG", "source_policy": "auto"},
         available_tools=AVAILABLE_TOOLS,
     )

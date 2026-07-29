@@ -46,17 +46,18 @@ class QdrantStore:
         return self._client
 
     @staticmethod
-    def compute_pipeline_hash(
+    def compute_indexing_config_hash(
         chunk_size: int,
         chunk_overlap: int,
         model_name: str,
         dim: int,
     ) -> str:
+        """计算索引配置指纹，用于追踪文档是用哪套切分+embedding参数构建的。"""
         payload = f"{chunk_size}:{chunk_overlap}:{model_name}:{dim}"
         return hashlib.md5(payload.encode()).hexdigest()[:12]
 
-    def ensure_collection(self, pipeline_hash: Optional[str] = None) -> str:
-        """幂等创建固定集合；pipeline_hash 仅为兼容旧调用，不影响集合名"""
+    def ensure_collection(self) -> str:
+        """幂等创建固定集合。"""
         name = self.collection_name
         if not self.client.collection_exists(name):
             from qdrant_client.models import Distance, VectorParams
@@ -104,7 +105,6 @@ class QdrantStore:
     def upsert_points(
         self,
         points: list[dict],
-        pipeline_hash: Optional[str] = None,
     ) -> None:
         from qdrant_client.models import PointStruct
 
@@ -170,7 +170,6 @@ class QdrantStore:
                 "page_start": point.payload.get("page_start"),
                 "page_end": point.payload.get("page_end"),
                 "heading_path": point.payload.get("heading_path"),
-                "parent_content": point.payload.get("parent_content"),
                 "source_type": point.payload.get("source_type"),
                 "location": point.payload.get("location"),
                 "score": round(point.score, 4) if point.score else 0.0,

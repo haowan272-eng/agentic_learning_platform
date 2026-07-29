@@ -27,15 +27,13 @@ from app.rag.chain import Retriever
 from app.rag.embeddings import get_embedder
 from app.rag.parent_context import attach_parent_contexts
 from app.rag.query_rewriter import get_query_rewriter
-from app.schemas.rag import AnswerRequest, AnswerResponse, CitationResult, MemoryResult, RetrievedSourceResult
+from app.schemas.rag import AnswerRequest, AnswerResponse, CitationResult, RetrievedSourceResult
 from app.services.conversation_context import ConversationContext, build_conversation_context
 from app.services.learning_service import (
     build_interview_capability_query,
     is_interview_capability_request,
     record_rag_interview_diagnostic,
 )
-from app.services.memory_service import load_memory, memory_context, remember_short_term_window, retrieval_query
-from app.services.short_term_memory import append_short_term_message
 
 logger = logging.getLogger(__name__)
 
@@ -182,23 +180,11 @@ def _persist_user_message(
         conversation_id=conversation.id,
         role="user",
         content=body.query,
-        memory_extracted=not body.use_memory,
     )
     db.add(user_message)
     conversation.updated_at = func.now()
     db.commit()
     db.refresh(user_message)
-    append_short_term_message(
-        user_id,
-        conversation.id,
-        user_message.id,
-        user_message.role,
-        user_message.content,
-        user_message.created_at,
-    )
-    if body.use_memory:
-        remember_short_term_window(db, user_id, conversation.id)
-        db.commit()
 
 
 def _persist_assistant_message(
@@ -207,7 +193,6 @@ def _persist_assistant_message(
     conversation: RagConversation,
     answer: str,
     citations: list[CitationResult],
-    memory_used: list[MemoryResult],
     degraded: bool,
 ) -> None:
     assistant_message = RagMessage(
@@ -218,25 +203,12 @@ def _persist_assistant_message(
             [citation.model_dump() for citation in citations],
             ensure_ascii=False,
         ),
-        memory_json=json.dumps(
-            [item.model_dump() for item in memory_used],
-            ensure_ascii=False,
-        ),
-        memory_extracted=True,
         degraded=degraded,
     )
     db.add(assistant_message)
     conversation.updated_at = func.now()
     db.commit()
     db.refresh(assistant_message)
-    append_short_term_message(
-        user_id,
-        conversation.id,
-        assistant_message.id,
-        assistant_message.role,
-        assistant_message.content,
-        assistant_message.created_at,
-    )
 
 
 def _record_interview_diagnostic(
@@ -364,7 +336,6 @@ def _generate_answer(
     interview_diagnostic: bool,
     evidence: str,
     records,
-    memory_text: str,
     warnings: list[dict],
     on_token: Optional[Callable[[str], None]],
 ):
@@ -381,7 +352,6 @@ def _generate_answer(
             "question": answer_question,
             "context": evidence,
             "history": context_state.history,
-            "memory": memory_text,
             "task_state": context_state.task_state,
         }
         if on_token is None:
@@ -439,14 +409,10 @@ def run_rag_answer(
     timer = _StepTimer()
     warnings: list[dict] = []
 
-    memories = load_memory(db, user.id) if body.use_memory else []
-    memory_text = memory_context(memories)
-    timer.mark("memory_ms")
-
     rewritten_query, rewrite_warnings = _rewrite_query_for_retrieval(
         question=body.query,
         history=context_state.history,
-        memory=memory_text,
+        memory="",
         task_state=context_state.task_state,
         enabled=had_conversation and body.rewrite_query and RAG_QUERY_REWRITE_ENABLED,
     )
@@ -461,7 +427,7 @@ def run_rag_answer(
         )
     results = _retrieve_records(
         db,
-        retrieval_query(retrieval_input, memories),
+        retrieval_input,
         top_k=body.top_k,
         document_id=body.document_id,
         kb_id=effective_kb_id,
@@ -479,7 +445,6 @@ def run_rag_answer(
         interview_diagnostic,
         evidence,
         records,
-        memory_text,
         warnings,
         on_token,
     )
@@ -487,11 +452,10 @@ def run_rag_answer(
 
     citations = [CitationResult(**record.citation_dict()) for record in response_records]
     retrieved_sources = [RetrievedSourceResult(**record.as_dict()) for record in records]
-    memory_used = [MemoryResult(**item.as_dict()) for item in memories]
     timings_ms.update(timer.timings_ms)
 
     persist_started = time.perf_counter()
-    _persist_assistant_message(db, user.id, conversation, answer, citations, memory_used, degraded)
+    _persist_assistant_message(db, user.id, conversation, answer, citations, degraded)
     if interview_diagnostic:
         _record_interview_diagnostic(db, user.id, body, conversation, effective_kb_id, answer, citations)
     timings_ms["persist_ms"] = _ms_since(persist_started)
@@ -507,7 +471,6 @@ def run_rag_answer(
         retrieved_contexts=[record.context for record in records],
         retrieved_sources=retrieved_sources,
         retrieved_count=len(results),
-        memory_used=memory_used,
         degraded=degraded,
         warnings=warnings,
         context_compacted=context_state.compacted,

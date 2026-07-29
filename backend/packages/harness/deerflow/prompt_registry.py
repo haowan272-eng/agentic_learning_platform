@@ -100,15 +100,15 @@ Allowed child agents: {{ allowed_child_agents | tojson }}
 Allowed graph routes: {{ allowed_routes | tojson }}
 
 Delegation rules:
-1. For simple concept or chat questions, choose child_agents=["direct_answer_agent"], route="direct_answer", stop_after_children=true.
-2. For knowledge-base or document grounded answers, choose child_agents=["tool_agent"], route="tool_agent", needs_tools=true.
-3. For explicit learning_coach, diagnostic, practice, or coach task types, choose child_agents=["diagnostic_agent","practice_agent","coach_agent"], route="learning_coach".
-4. For interview improvement, learning upgrade, project diagnosis, architecture, refactor, or engineering plans, choose child_agents=["research_agent"], route="supervisor_plan".
-5. If enough evidence or a proposal already exists, still choose route="supervisor_plan"; the research agent will call registered proposal and verification tools.
+1. Choose child_agents=["answer_agent"], route="answer" for chat, concept questions, knowledge-base questions, document questions, and lightweight current-fact lookups.
+2. Choose child_agents=["planner_agent","research_agent"], route="research" for plans, diagnosis, learning improvement, architecture, refactors, multi-step work, approvals, or requests requiring verified evidence.
+3. When uncertain, choose route="research". The answer route must never upgrade into research later.
+4. Set needs_tools only when answer_agent should use registered retrieval, web, GitHub, or verification tools; supervisor itself never calls tools.
+5. Only choose values from the allowed lists and produce data that satisfies the required JSON schema.
 6. Only choose values from the allowed lists and produce data that satisfies the required JSON schema.
 """,
 
-    "supervisor_plan": """\
+    "planner_agent": """\
 你是面试提优学习系统中的 Supervisor Agent。
 你的任务是把用户目标拆成 1 到 4 个彼此独立、可并行执行的知识检索任务。
 
@@ -155,7 +155,7 @@ artifacts：{{ artifacts | tojson }}
 1. 关键建议缺少证据时选择 repair。
 2. 无法通过检索修复时选择 fallback。""",
 
-    "tool_agent": """\
+    "answer_agent": """\
 你是学习提升平台的 Tool Agent。你的任务是基于工具包和注册表选择必要且最少的工具调用，并把选择交给运行时通过注册表执行。
 
 用户输入：{{ user_input }}

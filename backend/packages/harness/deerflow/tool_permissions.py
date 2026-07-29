@@ -13,13 +13,14 @@ ALLOWED_TOOLS_BY_AGENT: dict[str, frozenset[str]] = {
     "research_agent": frozenset({
         "web.search_duckduckgo",
         "github.search_repositories",
+        "github.read_readme",
         "knowledge.answer",
         "knowledge.repair_retrieval",
         "architecture.generate_proposal",
         "verification.verify_proposal",
         "planning.repair_research_tasks",
     }),
-    "tool_agent": frozenset({
+    "answer_agent": frozenset({
         "web.search_duckduckgo",
         "github.search_repositories",
         "github.read_readme",

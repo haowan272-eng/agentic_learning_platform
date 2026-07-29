@@ -71,7 +71,6 @@ export type AnswerQuestionPayload = {
   conversation_id?: number;
   top_k: number;
   bm25_weight: number;
-  use_memory: boolean;
   rewrite_query: boolean;
 };
 

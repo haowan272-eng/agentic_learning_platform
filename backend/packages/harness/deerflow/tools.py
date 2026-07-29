@@ -184,7 +184,6 @@ def knowledge_answer(args: dict[str, Any]) -> ToolResult:
             document_id=args.get("document_id"),
             kb_id=args.get("kb_id"),
             conversation_id=args.get("conversation_id"),
-            use_memory=bool(args.get("use_memory", True)),
             rewrite_query=bool(args.get("rewrite_query", True)),
         )
         response = run_rag_answer(db, str(args.get("username") or "admin"), request)

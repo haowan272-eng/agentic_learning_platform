@@ -9,7 +9,7 @@ from .knowledge_base import (
     MemberResponse,
 )
 from .conversation import ConversationResponse, MessageResponse
-from .rag import AnswerRequest, AnswerResponse, CitationResult, MemoryResult
+from .rag import AnswerRequest, AnswerResponse, CitationResult
 
 __all__ = [
     "LoginRequest", "TokenResponse", "RefreshRequest",

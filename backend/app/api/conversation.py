@@ -85,7 +85,5 @@ def delete_conversation(
     db.query(RagMessage).filter(RagMessage.conversation_id == conversation.id).delete()
     db.delete(conversation)
     db.commit()
-    from app.services.short_term_memory import delete_short_term_memory
-
-    delete_short_term_memory(user.id, conversation_id)
+    # RAG short-term memory system has been removed; Agent memory is managed separately.
     return {"ok": True}

@@ -12,15 +12,10 @@ from app.core.database import SessionLocal
 from app.memory.service import build_context_for_state, consolidate_task_memory, record_memory_event, summarize_task_session
 from app.memory.short_term import append_recent_event
 from app.observability import increment
-from app.services.learning_service import (
-    INTERVIEW_CAPABILITY_DIMENSIONS,
-    build_interview_scorecard,
-    interview_scoring_rubric_payload,
-    record_agent_learning_outputs,
-)
+from app.services.learning_service import record_agent_learning_outputs
 
 from .llm_gateway import llm_gateway
-from .planner import generate_plan, generate_research_source_decision, generate_supervisor_decision, generate_tool_agent_decision
+from .planner import generate_answer_agent_decision, generate_plan, generate_research_source_decision, generate_supervisor_decision
 from .schemas import (
     AgentEvent,
     AgentMessage,
@@ -57,6 +52,7 @@ MAX_REPAIR_COUNT = 2
 RESEARCH_AGENT_TOOLS = {
     "web.search_duckduckgo",
     "github.search_repositories",
+    "github.read_readme",
     "knowledge.answer",
     "knowledge.repair_retrieval",
     "architecture.generate_proposal",
@@ -202,39 +198,7 @@ def _supervisor_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, A
 def _supervisor_route(state: AgentTaskState) -> str:
     state = validate_agent_state(state)
     decision = state.get("supervisor_decision") or {}
-    return validate_supervisor_route(str(decision.get("route") or "supervisor_plan"))
-
-
-def _direct_answer(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
-    state = validate_agent_state(state)
-    source = "fallback"
-    try:
-        response = llm_gateway.invoke(
-            role="planner",
-            prompt=f"Answer the user directly without claiming tool or RAG usage.\n\nUser question: {state.get('user_input', '')}",
-            on_token=_llm_token_callback(state, "direct_answer"),
-        )
-        answer = response.content.strip()
-        source = f"{response.provider}:{response.model}"
-    except Exception:  # noqa: BLE001
-        answer = (
-            "This lightweight question did not require the full registered-tool workflow."
-            f"\n\nUser question: {state.get('user_input', '')}"
-        )
-    event = _event(
-        state,
-        store,
-        "task.completed",
-        "Router completed the task through direct answer.",
-        agent_name="direct_answer",
-        payload={"route_decision": state.get("route_decision") or {}, "model_source": source},
-    )
-    return validate_node_update({
-        "status": "completed",
-        "final_answer": answer,
-        "grounding": {"mode": "direct", "rag_used": False},
-        "emitted_events": [event],
-    })
+    return validate_supervisor_route(str(decision.get("route") or "research"))
 
 
 def _tools_for_agent(agent_name: str) -> list[dict[str, Any]]:
@@ -265,14 +229,14 @@ def _answer_from_tool_artifacts(artifacts: list[Artifact]) -> str:
     return "Registered tools ran, but no clear answer was produced. Please add more source material or ask a more specific question."
 
 
-def _tool_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+def _answer_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
     state = validate_agent_state(state)
-    available_tools = _tools_for_agent("tool_agent")
-    decision, source, error = generate_tool_agent_decision(
+    available_tools = _tools_for_agent("answer_agent")
+    decision, source, error = generate_answer_agent_decision(
         state,
         tool_package="deerflow.tools",
         available_tools=available_tools,
-        on_token=_llm_token_callback(state, "tool_agent"),
+        on_token=_llm_token_callback(state, "answer_agent"),
     )
     decision_payload = decision.model_dump(mode="json")
     source_policy = resolve_source_policy(state)
@@ -283,7 +247,7 @@ def _tool_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
             calls = [{
                 "call_id": f"tool-{uuid4().hex[:8]}",
                 "tool_name": "knowledge.answer",
-                "arguments": {"query": state.get("user_input") or "", "top_k": 5, "use_memory": True, "rewrite_query": True},
+                "arguments": {"query": state.get("user_input") or "", "top_k": 5, "rewrite_query": True},
                 "reason": "The task is restricted to the local knowledge base.",
             }]
     decision_payload["calls"] = calls
@@ -295,9 +259,9 @@ def _tool_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
         _event(
             state,
             store,
-            "tool.agent_decided",
-            "Tool Agent selected registered tools.",
-            agent_name="tool_agent",
+            "answer.agent_decided",
+            "Answer Agent selected registered tools.",
+            agent_name="answer_agent",
             payload={
                 "source": source,
                 "decision": decision_payload,
@@ -308,13 +272,46 @@ def _tool_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
         )
     ]
 
+    if not calls:
+        try:
+            response = llm_gateway.invoke(
+                role="planner",
+                prompt=(
+                    "Answer the user clearly and directly. Do not claim retrieval, web access, "
+                    "or citations that were not provided.\n\n"
+                    f"User question: {state.get('user_input', '')}"
+                ),
+                on_token=_llm_token_callback(state, "answer_agent"),
+            )
+            answer_draft = response.content.strip()
+            model_source = f"{response.provider}:{response.model}"
+        except Exception:  # noqa: BLE001
+            answer_draft = f"I can help with this question: {state.get('user_input', '')}"
+            model_source = "fallback"
+        feedback = {"success_count": 0, "failure_count": 0, "next_action": "complete", "results": [], "source": source, "error": error}
+        emitted_events.append(_event(
+            state,
+            store,
+            "agent.completed",
+            "Answer Agent prepared a direct response draft.",
+            agent_name="answer_agent",
+            payload={"model_source": model_source},
+        ))
+        return validate_node_update({
+            "status": "running",
+            "answer_draft": answer_draft,
+            "tool_feedback": feedback,
+            "grounding": {"mode": "answer_agent", "rag_used": False},
+            "emitted_events": emitted_events,
+        })
+
     for index, call in enumerate(decision_payload.get("calls") or []):
         tool_name = str(call.get("tool_name") or "")
         arguments = dict(call.get("arguments") or {})
         call_id = str(call.get("call_id") or f"tool-{index + 1}")
         messages.append({
             "message_id": str(uuid4()),
-            "from_agent": "tool_agent",
+            "from_agent": "answer_agent",
             "to_agent": tool_name,
             "kind": "tool_request",
             "correlation_id": call_id,
@@ -324,8 +321,8 @@ def _tool_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
             state,
             store,
             "tool.started",
-            f"Tool Agent invoked {tool_name}.",
-            agent_name="tool_agent",
+            f"Answer Agent invoked {tool_name}.",
+            agent_name="answer_agent",
             tool_name=tool_name,
             step_id=call_id,
             payload={"reason": call.get("reason")},
@@ -335,7 +332,7 @@ def _tool_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
             store,
             tool_name=tool_name,
             arguments=arguments,
-            agent_name="tool_agent",
+            agent_name="answer_agent",
             skill_name="registered_tool_use",
             step_id=call_id,
             call_id=call_id,
@@ -344,8 +341,8 @@ def _tool_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
         result = execution.result
         error_info = result.get("error") or {}
         feedback_item = {
-            "requester": "tool_agent",
-            "executor": "tool_agent",
+            "requester": "answer_agent",
+            "executor": "answer_agent",
             "call_id": call_id,
             "tool_name": tool_name,
             "ok": bool(result.get("ok")),
@@ -358,7 +355,7 @@ def _tool_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
         messages.append({
             "message_id": str(uuid4()),
             "from_agent": tool_name,
-            "to_agent": "tool_agent",
+            "to_agent": "answer_agent",
             "kind": "tool_result",
             "correlation_id": call_id,
             "payload": feedback_item,
@@ -368,7 +365,7 @@ def _tool_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
             store,
             "tool.completed" if result.get("ok") else "tool.failed",
             f"Registered tool {tool_name} completed.",
-            agent_name="tool_agent",
+            agent_name="answer_agent",
             tool_name=tool_name,
             step_id=call_id,
             payload=feedback_item,
@@ -398,7 +395,7 @@ def _tool_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
     }
     citations = [citation for artifact in artifacts for citation in artifact.get("citations", [])]
     grounding = next((artifact.get("grounding") for artifact in reversed(artifacts) if artifact.get("grounding")), None)
-    emitted_events.append(_event(state, store, "tool.feedback_ready", "Tool Agent produced structured feedback.", agent_name="tool_agent", payload=feedback))
+    emitted_events.append(_event(state, store, "answer.feedback_ready", "Answer Agent produced structured feedback.", agent_name="answer_agent", payload=feedback))
     update: dict[str, Any] = {
         "tool_feedback": feedback,
         "artifacts": artifacts,
@@ -410,155 +407,26 @@ def _tool_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
     }
     if next_action == "complete":
         update.update({
-            "status": "completed",
-            "final_answer": _answer_from_tool_artifacts(artifacts),
-            "grounding": grounding or {"mode": "tool_agent", "rag_used": bool(citations)},
+            "status": "running",
+            "answer_draft": _answer_from_tool_artifacts(artifacts),
+            "grounding": grounding or {"mode": "answer_agent", "rag_used": bool(citations)},
         })
-        emitted_events.append(_event(state, store, "task.completed", "Tool Agent completed the task.", agent_name="tool_agent", payload={"tool_feedback": feedback}))
+        emitted_events.append(_event(state, store, "agent.completed", "Answer Agent prepared a response draft.", agent_name="answer_agent", payload={"tool_feedback": feedback}))
     else:
         update["status"] = "running"
     return validate_node_update(update)
 
 
-def _tool_agent_route(state: AgentTaskState) -> str:
+def _answer_agent_route(state: AgentTaskState) -> str:
     state = validate_agent_state(state)
     feedback = state.get("tool_feedback") or {}
     next_action = str(feedback.get("next_action") or "complete")
-    if next_action == "research_agent":
-        return "research_agent"
     if next_action == "fallback":
         return "fallback_response"
-    return "complete"
+    return "final_response"
 
 
-def _diagnostic_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
-    state = validate_agent_state(state)
-    user_input = str(state.get("user_input") or "").strip()
-    selected_dimensions = [
-        item
-        for item in INTERVIEW_CAPABILITY_DIMENSIONS
-        if item["title"] in user_input or item["key"].lower() in user_input.lower()
-    ]
-    if not selected_dimensions:
-        selected_dimensions = list(INTERVIEW_CAPABILITY_DIMENSIONS)
-    scorecard = build_interview_scorecard(text=user_input, citation_count=len(state.get("citations") or []), weakness_count=len(selected_dimensions))
-    diagnosis = {
-        "goal": user_input,
-        "target_role": "interview_improvement" if "interview" in user_input.lower() else "learning_improvement",
-        "current_level": "needs_diagnostic",
-        "weaknesses": [
-            {
-                "topic": item["title"],
-                "severity": round(0.76 - index * 0.06, 2),
-                "category": item["key"],
-                "focus": item["focus"],
-            }
-            for index, item in enumerate(selected_dimensions[:6])
-        ],
-        "scoring_rubric": interview_scoring_rubric_payload(),
-        "scorecard": scorecard,
-        "success_criteria": [
-            "Accuracy: claims should be grounded in resume, JD, or cited material.",
-            "Completeness: cover the core question and role requirements.",
-            "Structure: answer with a clear framework such as STAR when suitable.",
-            "Depth: explain principles, tradeoffs, boundaries, and risks.",
-            "Credibility: include project evidence and measurable outcomes.",
-            "Interview fit: adapt the answer to the target role and interview context.",
-        ],
-    }
-    artifact: Artifact = {
-        "artifact_id": f"diagnostic-{uuid4().hex[:12]}",
-        "kind": "learning_diagnostic",
-        "producer": "diagnostic_agent",
-        "correlation_id": "diagnostic",
-        "data": diagnosis,
-        "citations": [],
-        "confidence": 0.72,
-        "error": None,
-    }
-    event = _event(state, store, "agent.completed", "Diagnostic Agent created a learning profile and weakness map.", agent_name="diagnostic_agent", payload={"artifact_id": artifact["artifact_id"], "weakness_count": len(diagnosis["weaknesses"])})
-    _record_memory_event(state, event_type="learning_diagnostic", category="learning_goal", content=user_input[:1200], metadata={"weaknesses": diagnosis["weaknesses"]})
-    return validate_node_update({"artifacts": [artifact], "memory_context": {"learning_diagnostic": diagnosis}, "emitted_events": [event]})
-
-
-def _practice_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
-    state = validate_agent_state(state)
-    diagnostic = next((item for item in reversed(state.get("artifacts") or []) if item.get("kind") == "learning_diagnostic"), {})
-    weaknesses = ((diagnostic.get("data") or {}).get("weaknesses") or [])[:6]
-    practices = []
-    for item in weaknesses or [{"topic": "learning_gap", "severity": 0.5}]:
-        topic = str(item.get("topic") or "learning_gap")
-        dimension = next((cap for cap in INTERVIEW_CAPABILITY_DIMENSIONS if cap["title"] == topic or cap["key"] == item.get("category")), None)
-        practices.append({
-            "topic": topic,
-            "difficulty": "hard" if float(item.get("severity") or 0.5) >= 0.65 else "medium",
-            "question": dimension["practice"] if dimension else f"Practice explaining {topic} with evidence, tradeoffs, and a concise conclusion.",
-            "expected_answer": (
-                f"Cover {dimension['focus']} with a structured answer, project evidence, tradeoffs, risk boundaries, and a 0-5 self score."
-            ) if dimension else "Use a structured answer with evidence, tradeoffs, risk boundaries, and a 0-5 self score.",
-            "scoring_rubric": interview_scoring_rubric_payload(),
-        })
-    artifact: Artifact = {
-        "artifact_id": f"practice-{uuid4().hex[:12]}",
-        "kind": "learning_practice_plan",
-        "producer": "practice_agent",
-        "correlation_id": "practice",
-        "data": {"practices": practices},
-        "citations": [],
-        "confidence": 0.74,
-        "error": None,
-    }
-    event = _event(state, store, "agent.completed", "Practice Agent generated targeted exercises.", agent_name="practice_agent", payload={"artifact_id": artifact["artifact_id"], "practice_count": len(practices)})
-    return validate_node_update({"artifacts": [artifact], "emitted_events": [event]})
-
-
-def _coach_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
-    state = validate_agent_state(state)
-    diagnostic = next((item for item in reversed(state.get("artifacts") or []) if item.get("kind") == "learning_diagnostic"), {})
-    practice_plan = next((item for item in reversed(state.get("artifacts") or []) if item.get("kind") == "learning_practice_plan"), {})
-    weaknesses = ((diagnostic.get("data") or {}).get("weaknesses") or [])[:6]
-    practices = ((practice_plan.get("data") or {}).get("practices") or [])[:6]
-    scorecard = (diagnostic.get("data") or {}).get("scorecard") or build_interview_scorecard(
-        text=str(state.get("user_input") or ""),
-        citation_count=len(state.get("citations") or []),
-        weakness_count=len(weaknesses),
-    )
-    diagnostic_data = diagnostic.get("data") or {}
-    lines = [
-        "# Learning Coach Review",
-        "",
-        "## Focus",
-        f"- Goal: {diagnostic_data.get('goal') or state.get('user_input')}",
-        *[
-            f"- {item.get('topic')}: {item.get('focus') or 'practice with evidence'}; severity {item.get('severity')}"
-            for item in weaknesses
-        ],
-        *_format_scorecard(scorecard),
-        "",
-        "## Practice",
-        *[f"- {item.get('question')}" for item in practices],
-        "",
-        "## Next Steps",
-        "- Answer each practice question out loud and keep the response under three minutes.",
-        "- Add one concrete project example, one tradeoff, and one risk boundary to each answer.",
-        "- Re-score with the rubric after three attempts and keep the strongest version.",
-    ]
-    final_answer = "\n".join(lines)
-    try:
-        with SessionLocal() as db:
-            record_agent_learning_outputs(db, {**state, "citations": state.get("citations") or []}, final_answer)
-    except Exception:  # noqa: BLE001
-        pass
-    event = _event(state, store, "task.completed", "Coach Agent persisted learning profile, practice, and review items.", agent_name="coach_agent", payload={"practice_count": len(practices), "weakness_count": len(weaknesses)})
-    return validate_node_update({
-        "status": "completed",
-        "final_answer": final_answer,
-        "grounding": {"mode": "learning_coach", "rag_used": False},
-        "emitted_events": [event],
-    })
-
-
-def _supervisor_plan(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+def _planner_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
     state = validate_agent_state(state)
     try:
         memory_context = build_context_for_state({key: state.get(key) for key in ("user_id", "session_id", "task_id", "run_id")})
@@ -579,21 +447,21 @@ def _supervisor_plan(state: AgentTaskState, store: RuntimeStore) -> dict[str, An
     )
     plan, source, error = generate_plan(
         {**state, "memory_context": memory_context, "feedback_summary": feedback_summary},
-        on_token=_llm_token_callback(state, "supervisor"),
+        on_token=_llm_token_callback(state, "planner_agent"),
     )
     if len(plan.research_tasks) > int((state.get("budget") or {}).get("max_steps") or 8):
         raise AgentBudgetExceeded("Supervisor plan exceeds max_steps.")
     status: Literal["waiting_user", "running"] = "waiting_user" if plan.approval_required else "running"
-    _record_memory_event(state, event_type="user_goal_set", category="learning_goal", content=str(state.get("user_input") or ""), metadata={"confidence": 0.7, "source": "supervisor"})
+    _record_memory_event(state, event_type="user_goal_set", category="learning_goal", content=str(state.get("user_input") or ""), metadata={"confidence": 0.7, "source": "planner_agent"})
     plan_payload = plan.model_dump(mode="json")
     store.save_plan({"task_id": state["task_id"], "run_id": state["run_id"], "plan_version": int(state.get("repair_count") or 0) + 1, "source": source, "status": "awaiting_approval" if plan.approval_required else "active", "goal": plan.goal, "intent": plan.intent, "steps": plan_payload.get("research_tasks", []), "error_message": error})
-    plan_event = _event(state, store, "plan.created", "Supervisor created a parallel multi-agent plan.", agent_name="supervisor", payload={"source": source, "plan": plan_payload, "error": error})
+    plan_event = _event(state, store, "plan.created", "Planner Agent created an executable research plan.", agent_name="planner_agent", payload={"source": source, "plan": plan_payload, "error": error})
     return validate_node_update({"memory_context": memory_context, "plan": plan_payload, "goal": plan.goal, "intent": plan.intent, "planning_source": source, "planner_error": error, "status": status, "artifacts": [memory_artifact], "emitted_events": [memory_event, plan_event]})
 
 
 def _plan_route(state: AgentTaskState) -> str:
     state = validate_agent_state(state)
-    route = "approval_gate" if (state.get("plan") or {}).get("approval_required") else "dispatch_research"
+    route = "approval_gate" if (state.get("plan") or {}).get("approval_required") else "research_agent"
     return validate_plan_route(route)
 
 
@@ -607,15 +475,10 @@ def _approval_gate(state: AgentTaskState, store: RuntimeStore) -> Any:
     event = _event(state, store, "approval.resolved", f"User approval action: {action}.", agent_name="human_gate", payload={"decision": decision})
     if action == "edit":
         edited_input = str((decision or {}).get("user_input") or state["user_input"])
-        return Command(update=validate_node_update({"user_input": edited_input, "approval": {"decision": decision}, "status": "running", "emitted_events": [event]}), goto="supervisor_plan")
+        return Command(update=validate_node_update({"user_input": edited_input, "approval": {"decision": decision}, "status": "running", "emitted_events": [event]}), goto="planner_agent")
     if action == "approve":
-        return Command(update=validate_node_update({"approval": {"decision": decision}, "status": "running", "emitted_events": [event]}), goto="dispatch_research")
+        return Command(update=validate_node_update({"approval": {"decision": decision}, "status": "running", "emitted_events": [event]}), goto="research_agent")
     return Command(update=validate_node_update({"approval": {"decision": decision}, "status": "running", "emitted_events": [event]}), goto="fallback_response")
-
-
-def _dispatch_research(state: AgentTaskState) -> dict[str, Any]:
-    state = validate_agent_state(state)
-    return validate_node_update({"status": "running"})
 
 
 def _research_tasks_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -904,7 +767,6 @@ def _research_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any
                     {
                         "query": query,
                         "top_k": top_k,
-                        "use_memory": True,
                         "rewrite_query": True,
                         "username": state.get("username"),
                         "user_id": state.get("user_id"),
@@ -1097,6 +959,60 @@ def _research_agent_route(state: AgentTaskState) -> str:
     state = validate_agent_state(state)
     action = state.get("next_action")
     if action == "complete":
+        return "review_agent"
+    if action == "ask_user":
+        return "approval_gate"
+    return "fallback_response"
+
+
+def _review_agent(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
+    """Apply the final publication gate without performing new research or tool calls."""
+    state = validate_agent_state(state)
+    verification = dict(state.get("verification") or {})
+    proposal = dict(state.get("proposal") or {})
+    verification_status = str(verification.get("status") or "fallback")
+    has_deliverable = bool(proposal.get("summary") or proposal.get("sections"))
+
+    if verification_status == "needs_approval":
+        next_action = "ask_user"
+        outcome = "needs_confirmation"
+        reason = "The research result requires user confirmation before publication."
+    elif verification_status == "passed" and has_deliverable:
+        next_action = "complete"
+        outcome = "approved"
+        reason = "Research evidence and the deliverable passed the publication review."
+    else:
+        next_action = "fallback"
+        outcome = "rejected"
+        reason = "The research result is missing a verified deliverable or sufficient evidence."
+
+    review = {
+        "outcome": outcome,
+        "reason": reason,
+        "verification_status": verification_status,
+        "proposal_present": has_deliverable,
+        "citation_count": len([citation for item in state.get("artifacts") or [] for citation in item.get("citations") or []]),
+    }
+    event = _event(
+        state,
+        store,
+        "review.completed",
+        "Review Agent completed the final publication check.",
+        agent_name="review_agent",
+        payload=review,
+    )
+    return validate_node_update({
+        "status": "running",
+        "review": review,
+        "next_action": next_action,
+        "emitted_events": [event],
+    })
+
+
+def _review_agent_route(state: AgentTaskState) -> str:
+    state = validate_agent_state(state)
+    action = state.get("next_action")
+    if action == "complete":
         return "final_response"
     if action == "ask_user":
         return "approval_gate"
@@ -1105,6 +1021,25 @@ def _research_agent_route(state: AgentTaskState) -> str:
 
 def _final_response(state: AgentTaskState, store: RuntimeStore) -> dict[str, Any]:
     state = validate_agent_state(state)
+    answer_draft = str(state.get("answer_draft") or "").strip()
+    if answer_draft:
+        citations = [citation for item in state.get("artifacts", []) for citation in item.get("citations", [])]
+        grounding = state.get("grounding") or {"mode": "answer_agent", "rag_used": bool(citations)}
+        event = _event(
+            state,
+            store,
+            "task.completed",
+            "Answer task completed.",
+            agent_name="runtime",
+            payload={"citation_count": len(citations)},
+        )
+        return validate_node_update({
+            "status": "completed",
+            "final_answer": answer_draft,
+            "citations": citations,
+            "grounding": grounding,
+            "emitted_events": [event],
+        })
     proposal = state.get("proposal") or {}
     sections = proposal.get("sections") or []
     lines = [f"# {proposal.get('title', 'Project Improvement Proposal')}", "", proposal.get("summary", "")]
@@ -1171,34 +1106,22 @@ def build_agent_graph(store: RuntimeStore, *, checkpointer: Any) -> Any:
         raise RuntimeError(f"langgraph is required for Agent Runtime: {LANGGRAPH_IMPORT_ERROR}")
     builder = StateGraph(AgentTaskState)
     builder.add_node("supervisor_agent", lambda state: _supervisor_agent(state, store))
-    builder.add_node("direct_answer", lambda state: _direct_answer(state, store))
-    builder.add_node("tool_agent", lambda state: _tool_agent(state, store))
-    builder.add_node("diagnostic_agent", lambda state: _diagnostic_agent(state, store))
-    builder.add_node("practice_agent", lambda state: _practice_agent(state, store))
-    builder.add_node("coach_agent", lambda state: _coach_agent(state, store))
-    builder.add_node("supervisor_plan", lambda state: _supervisor_plan(state, store))
+    builder.add_node("answer_agent", lambda state: _answer_agent(state, store))
+    builder.add_node("planner_agent", lambda state: _planner_agent(state, store))
     builder.add_node("approval_gate", lambda state: _approval_gate(state, store))
-    builder.add_node("dispatch_research", lambda state: _dispatch_research(state))
     builder.add_node("research_agent", lambda state: _research_agent(state, store))
+    builder.add_node("review_agent", lambda state: _review_agent(state, store))
     builder.add_node("final_response", lambda state: _final_response(state, store))
     builder.add_node("fallback_response", lambda state: _fallback_response(state, store))
     builder.add_edge(START, "supervisor_agent")
     builder.add_conditional_edges("supervisor_agent", _supervisor_route, {
-        "direct_answer": "direct_answer",
-        "tool_agent": "tool_agent",
-        "supervisor_plan": "supervisor_plan",
-        "learning_coach": "diagnostic_agent",
-        "final_response": "final_response",
-        "fallback_response": "fallback_response",
+        "answer": "answer_agent",
+        "research": "planner_agent",
     })
-    builder.add_conditional_edges("tool_agent", _tool_agent_route, {"complete": END, "research_agent": "research_agent", "fallback_response": "fallback_response"})
-    builder.add_edge("diagnostic_agent", "practice_agent")
-    builder.add_edge("practice_agent", "coach_agent")
-    builder.add_conditional_edges("supervisor_plan", _plan_route, {"approval_gate": "approval_gate", "dispatch_research": "dispatch_research"})
-    builder.add_edge("dispatch_research", "research_agent")
-    builder.add_conditional_edges("research_agent", _research_agent_route, {"final_response": "final_response", "approval_gate": "approval_gate", "fallback_response": "fallback_response"})
-    builder.add_edge("direct_answer", END)
-    builder.add_edge("coach_agent", END)
+    builder.add_conditional_edges("answer_agent", _answer_agent_route, {"final_response": "final_response", "fallback_response": "fallback_response"})
+    builder.add_conditional_edges("planner_agent", _plan_route, {"approval_gate": "approval_gate", "research_agent": "research_agent"})
+    builder.add_conditional_edges("research_agent", _research_agent_route, {"review_agent": "review_agent", "approval_gate": "approval_gate", "fallback_response": "fallback_response"})
+    builder.add_conditional_edges("review_agent", _review_agent_route, {"final_response": "final_response", "approval_gate": "approval_gate", "fallback_response": "fallback_response"})
     builder.add_edge("final_response", END)
     builder.add_edge("fallback_response", END)
     return builder.compile(checkpointer=checkpointer)

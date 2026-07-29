@@ -164,7 +164,6 @@ class Embedder:
                 "page_end": row.page_end,
                 "filename": (doc.original_file_name or doc.file_name or "未知文档") if doc else "未知文档",
                 "heading_path": metadata.get("heading_path"),
-                "parent_content": metadata.get("parent_content"),
                 "source_type": metadata.get("source_type"),
                 "location": metadata.get("location"),
             }
@@ -209,7 +208,6 @@ class Embedder:
         kb_id: Optional[int] = None,
         batch_size: int = 32,
         strict_vectorstore: bool = False,
-        pipeline_hash: Optional[str] = None,
     ) -> int:
         """
         读取分块，编码并写入 chunk_embeddings 表。
@@ -223,7 +221,6 @@ class Embedder:
             kb_id: 可选，限定知识库。
             batch_size: 编码时的批次大小。
             strict_vectorstore: True 时 Qdrant 写入失败将抛出异常，使后台任务明确标记失败。
-            pipeline_hash: 旧版本兼容参数，当前不会改变目标集合。
 
         返回：本次新增或更新的 embedding 数量。
         """
@@ -461,7 +458,6 @@ class Embedder:
                     "page_end": chunk.get("page_end"),
                     "score": round(dense.get("score", 0.0), 4),
                     "heading_path": dense.get("heading_path") or chunk.get("heading_path"),
-                    "parent_content": dense.get("parent_content") or chunk.get("parent_content"),
                     "filename": dense.get("filename") or chunk.get("filename", ""),
                     "source_type": dense.get("source_type") or chunk.get("source_type"),
                     "location": dense.get("location") or chunk.get("location"),

@@ -163,19 +163,10 @@ def test_stream_answer_emits_tokens_and_validated_final(
     assert "event: done" in response.text
 
 
-def test_memory_enhances_retrieval_and_llm_fallback_is_persisted(
+def test_retrieval_and_llm_fallback_is_persisted(
     client, auth_user, db_session, monkeypatch
 ):
-    from app.models import UserMemory
-
     user, headers = auth_user
-    db_session.add(UserMemory(
-        user_id=user.id,
-        keyword="偏好中文回答",
-        category="preference",
-        weight=2.0,
-    ))
-    db_session.flush()
     embedder = MagicMock()
     monkeypatch.setattr("app.services.rag_service.get_embedder", lambda: embedder)
     captured = {}
@@ -197,8 +188,8 @@ def test_memory_enhances_retrieval_and_llm_fallback_is_persisted(
     assert response.status_code == 200
     data = response.json()
     assert data["degraded"] is True
-    assert data["memory_used"][0]["keyword"] == "偏好中文回答"
-    assert "偏好中文回答" in captured["query"]
+    # RAG no longer loads memory — retrieval uses raw/rewritten query only.
+    assert "query" in captured
     assert data["citations"][0]["source_id"] == 1
 
     messages = client.get(
@@ -206,7 +197,6 @@ def test_memory_enhances_retrieval_and_llm_fallback_is_persisted(
         headers=headers,
     ).json()
     assert messages[-1]["degraded"] is True
-    assert "偏好中文回答" in messages[-1]["memory_json"]
 
 
 def test_answer_rejects_other_users_conversation(
@@ -230,9 +220,10 @@ def test_answer_rejects_other_users_conversation(
     assert response.status_code == 404
 
 
-def test_use_memory_false_does_not_create_long_term_memory(
+def test_rag_answer_no_longer_creates_memory(
     client, auth_user, db_session, monkeypatch
 ):
+    """RAG memory system has been removed; answering no longer creates UserMemory entries."""
     from app.models import RagMessage, UserMemory
 
     _, headers = auth_user
@@ -241,11 +232,10 @@ def test_use_memory_false_does_not_create_long_term_memory(
 
     response = client.post(
         "/embedding/rag/answer",
-        json={"query": "我喜欢安静的地方", "use_memory": False},
+        json={"query": "我喜欢安静的地方"},
         headers=headers,
     )
 
     assert response.status_code == 200
-    assert db_session.query(UserMemory).count() == 0
-    user_message = db_session.query(RagMessage).filter(RagMessage.role == "user").one()
-    assert user_message.memory_extracted is True
+    # RAG no longer writes to UserMemory — that's now the Agent's responsibility.
+    assert "memory_used" not in response.json()

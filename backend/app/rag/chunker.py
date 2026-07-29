@@ -591,7 +591,6 @@ class MarkdownChunk:
     location: Optional[str]
     modality: str
     page_number: Optional[int] = None
-    parent_content: Optional[str] = None
 
     def metadata(self) -> dict:
         return {
@@ -727,11 +726,8 @@ def chunk_markdown(
                 )
             )
 
-    window_radius = 1
-    for index, chunk in enumerate(chunks):
-        start = max(0, index - window_radius)
-        end = min(len(chunks), index + window_radius + 1)
-        chunk.parent_content = "\n\n".join(chunks[i].content for i in range(start, end))
+    # Parent context is NOT computed here — it is attached at retrieval time by
+    # parent_context.attach_parent_contexts() with a token-budget-aware algorithm.
     return chunks
 
 

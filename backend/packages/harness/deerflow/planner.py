@@ -50,7 +50,7 @@ class SupervisorDecision(BaseModel):
     needs_tools: bool
     needs_verification: bool
     stop_after_children: bool
-    response_mode: Literal["direct", "rag_answer", "draft", "verified_plan", "fallback"]
+    response_mode: Literal["answer", "research"]
     query: str | None = Field(default=None, max_length=2000)
 
     @model_validator(mode="after")
@@ -64,12 +64,10 @@ class SupervisorDecision(BaseModel):
                 f"child_agents must be {expected_agents!r} when route={self.route!r} "
                 f"and needs_verification={self.needs_verification!r}."
             )
-        if self.route == "direct_answer" and (self.needs_tools or self.needs_rag or self.needs_verification):
-            raise ValueError("direct_answer cannot require tools, RAG, or verification.")
-        if self.route == "tool_agent" and not self.needs_tools:
-            raise ValueError("tool_agent must set needs_tools=true.")
-        if self.route == "supervisor_plan" and not self.needs_verification:
-            raise ValueError("supervisor_plan must set needs_verification=true.")
+        if self.route == "answer" and self.needs_verification:
+            raise ValueError("answer cannot require research verification.")
+        if self.route == "research" and not self.needs_verification:
+            raise ValueError("research must set needs_verification=true.")
         return self
 
 
@@ -80,9 +78,9 @@ class ToolCallSpec(BaseModel):
     reason: str = Field(..., min_length=1, max_length=500)
 
 
-class ToolAgentDecision(BaseModel):
-    calls: list[ToolCallSpec] = Field(..., min_length=1, max_length=4)
-    next_action: Literal["complete", "research_agent", "fallback"]
+class AnswerAgentDecision(BaseModel):
+    calls: list[ToolCallSpec] = Field(default_factory=list, max_length=4)
+    next_action: Literal["complete", "fallback"]
     reason: str = Field(..., min_length=1, max_length=1000)
     confidence: float = Field(ge=0, le=1)
 
@@ -168,17 +166,11 @@ def default_plan(state: dict[str, Any]) -> AgentPlan:
 
 
 def _child_agents_for_route(route: SupervisorRoute, *, needs_verification: bool) -> list[ChildAgent]:
-    if route == "direct_answer":
-        return ["direct_answer_agent"]
-    if route == "tool_agent":
-        return ["tool_agent"]
-    if route == "supervisor_plan":
-        return ["research_agent"]
-    if route == "learning_coach":
-        return ["diagnostic_agent", "practice_agent", "coach_agent"]
-    if route == "final_response":
-        return ["research_agent"]
-    return ["direct_answer_agent"]
+    if route == "answer":
+        return ["answer_agent"]
+    if route == "research":
+        return ["planner_agent", "research_agent"]
+    return ["answer_agent"]
 
 
 def default_supervisor_decision(state: dict[str, Any], *, reason: str | None = None) -> SupervisorDecision:
@@ -195,57 +187,57 @@ def default_supervisor_decision(state: dict[str, Any], *, reason: str | None = N
     direct_terms = ("是什么", "解释", "什么意思", "区别", "怎么理解", "你好", "谢谢", "早上好", "好的", "hello", "hi", "在吗")
 
     if any(term in task_type for term in ("learning_coach", "diagnostic", "practice", "coach")):
-        route = "learning_coach"
-        intent = "learning_coach"
+        route = "research"
+        intent = "learning_improvement"
         confidence = 0.82
         needs_rag = has_rag_scope
-        needs_verification = False
-        stop_after_children = True
-        response_mode = "verified_plan"
+        needs_verification = True
+        stop_after_children = False
+        response_mode = "research"
         query = user_input
         fallback_reason = "学习提升任务走诊断、练习、教练短链路。"
     elif any(term in task_type for term in ("project", "upgrade", "improvement", "interview")) or any(term in text for term in heavy_terms):
-        route: SupervisorRoute = "supervisor_plan"
+        route: SupervisorRoute = "research"
         intent = str(state.get("task_type") or "interview_improvement")
         confidence = 0.72
         needs_rag = True
         needs_verification = True
         stop_after_children = False
-        response_mode: Literal["direct", "rag_answer", "draft", "verified_plan", "fallback"] = "verified_plan"
+        response_mode: Literal["answer", "research"] = "research"
         query = user_input
         fallback_reason = "请求涉及规划、诊断、练习或长期提升，需要进入多 Agent 方案链路。"
     elif has_rag_scope or any(term in text for term in rag_terms):
-        route = "tool_agent"
+        route = "answer"
         intent = "rag_question"
         confidence = 0.68
         needs_rag = True
         needs_verification = False
         stop_after_children = True
-        response_mode = "rag_answer"
+        response_mode = "answer"
         query = user_input
         fallback_reason = "请求包含知识库上下文或具体资料问题，交给 Tool Agent 做检索问答。"
     elif len(user_input) <= 160 or any(term in text for term in direct_terms):
-        route = "direct_answer"
+        route = "answer"
         intent = "direct_chat"
         confidence = 0.62
         needs_rag = False
         needs_verification = False
         stop_after_children = True
-        response_mode = "direct"
+        response_mode = "answer"
         query = None
         fallback_reason = "请求较轻量或偏闲聊，无需调用 RAG 或多 Agent 链路。"
     else:
-        route = "supervisor_plan"
+        route = "research"
         intent = str(state.get("task_type") or "interview_improvement")
         confidence = 0.55
         needs_rag = True
         needs_verification = True
         stop_after_children = False
-        response_mode = "verified_plan"
+        response_mode = "research"
         query = user_input
         fallback_reason = "输入较开放，按学习提升或方案设计任务进入多 Agent 链路。"
 
-    needs_tools = route == "tool_agent" or needs_rag
+    needs_tools = route == "answer" and needs_rag
     return SupervisorDecision(
         child_agents=_child_agents_for_route(route, needs_verification=needs_verification),
         route=route,
@@ -271,19 +263,26 @@ def _pick_tool(available_tools: list[dict[str, Any]], *, category: str, preferre
     return preferred or next(iter(names), "")
 
 
-def default_tool_agent_decision(
+def default_answer_agent_decision(
     state: dict[str, Any],
     *,
     available_tools: list[dict[str, Any]] | None = None,
     reason: str | None = None,
-) -> ToolAgentDecision:
+) -> AnswerAgentDecision:
     decision = state.get("route_decision") or {}
     query = str(decision.get("query") or state.get("user_input") or "").strip()
     tools = available_tools or json.loads(_describe_available_tools())
+    if decision and not bool(decision.get("needs_tools")):
+        return AnswerAgentDecision(
+            calls=[],
+            next_action="complete",
+            reason=reason or "The question can be answered directly without retrieval or external tools.",
+            confidence=0.7,
+        )
     has_proposal = bool(state.get("proposal"))
     source_policy = resolve_source_policy(state)
     if has_proposal:
-        return ToolAgentDecision(
+        return AnswerAgentDecision(
             calls=[
                 ToolCallSpec(
                     tool_name=_pick_tool(tools, category="verification", preferred="knowledge.verify_claim"),
@@ -291,14 +290,14 @@ def default_tool_agent_decision(
                     reason="已有方案时优先检查证据支撑。",
                 )
             ],
-            next_action="research_agent",
+            next_action="complete",
             reason=reason or "使用确定性工具计划校验已有方案。",
             confidence=0.62,
         )
     calls = [
         ToolCallSpec(
             tool_name=_pick_tool(tools, category="rag", preferred="knowledge.answer"),
-            arguments={"query": query, "top_k": 5, "use_memory": True, "rewrite_query": True},
+            arguments={"query": query, "top_k": 5, "rewrite_query": True},
             reason="Retrieve private knowledge-base evidence when it is available.",
         )
     ]
@@ -310,7 +309,7 @@ def default_tool_agent_decision(
                 reason="Supplement private retrieval with current public web sources.",
             )
         )
-    return ToolAgentDecision(
+    return AnswerAgentDecision(
         calls=calls,
         next_action="complete",
         reason=reason or "Use local and public sources together unless the user explicitly restricts the task to local knowledge.",
@@ -359,24 +358,18 @@ def _supervisor_agent_prompt(state: dict[str, Any]) -> str:
         "has_rag_scope": bool(state.get("kb_id") or state.get("document_id") or state.get("conversation_id")),
         "existing_artifact_count": len(state.get("artifacts", []) or []),
         "has_proposal": bool(state.get("proposal")),
-        "allowed_child_agents": [
-            "direct_answer_agent", "tool_agent", "research_agent",
-            "diagnostic_agent", "practice_agent", "coach_agent",
-        ],
-        "allowed_routes": [
-            "direct_answer", "tool_agent", "supervisor_plan", "learning_coach",
-            "final_response", "fallback_response",
-        ],
+        "allowed_child_agents": ["answer_agent", "planner_agent", "research_agent"],
+        "allowed_routes": ["answer", "research"],
     }, role="planner", state=state)
 
 
-def _tool_agent_prompt(
+def _answer_agent_prompt(
     state: dict[str, Any],
     *,
     tool_package: str,
     available_tools: list[dict[str, Any]],
 ) -> str:
-    return _render_prompt("tool_agent", {
+    prompt = _render_prompt("answer_agent", {
         "user_input": state.get("user_input", ""),
         "route_decision": state.get("route_decision", {}),
         "tool_package": tool_package,
@@ -385,6 +378,12 @@ def _tool_agent_prompt(
         "proposal": state.get("proposal", {}),
         "source_policy": resolve_source_policy(state),
     }, role="planner", state=state)
+    return (
+        f"{prompt}\n\n"
+        "This is the Answer Agent. Return only the registered tool calls needed for one response. "
+        "For a self-contained answer, return calls=[] and next_action=complete. "
+        "next_action must be either complete or fallback. Never delegate to research_agent."
+    )
 
 
 def _research_source_prompt(
@@ -404,7 +403,7 @@ def _research_source_prompt(
 
 
 def _planner_prompt(state: dict[str, Any]) -> str:
-    return _render_prompt("supervisor_plan", {
+    return _render_prompt("planner_agent", {
         "user_input": state.get("user_input", ""),
         "task_type": state.get("task_type", "project_upgrade"),
         "memory_context": state.get("memory_context", {}),
@@ -525,27 +524,27 @@ def generate_supervisor_decision(
         return default_supervisor_decision(state, reason=error), "fallback", error
 
 
-def generate_tool_agent_decision(
+def generate_answer_agent_decision(
     state: dict[str, Any],
     *,
     tool_package: str,
     available_tools: list[dict[str, Any]],
     on_token: TokenCallback | None = None,
-) -> tuple[ToolAgentDecision, str, str | None]:
+) -> tuple[AnswerAgentDecision, str, str | None]:
     try:
         decision, source, _ptk, _ctk = _invoke_structured(
             "planner",
-            _tool_agent_prompt(state, tool_package=tool_package, available_tools=available_tools),
-            ToolAgentDecision,
+            _answer_agent_prompt(state, tool_package=tool_package, available_tools=available_tools),
+            AnswerAgentDecision,
             on_token,
-            template_name="tool_agent",
+            template_name="answer_agent",
             task_id=str(state.get("task_id", "")),
         )
         return decision, source, None  # type: ignore[return-value]
     except Exception as exc:  # noqa: BLE001
-        error = f"Tool Agent LLM call failed; applied deterministic registered-tool decision: {exc}"
+        error = f"Answer Agent LLM call failed; applied deterministic registered-tool decision: {exc}"
         logger.warning(error)
-        return default_tool_agent_decision(state, available_tools=available_tools, reason=error), "fallback", error
+        return default_answer_agent_decision(state, available_tools=available_tools, reason=error), "fallback", error
 
 
 def default_research_source_decision(state: dict[str, Any]) -> ResearchSourceDecision:
@@ -612,7 +611,7 @@ def generate_plan(
         try:
             candidate, source, ptk, ctk = _invoke_structured(
                 "planner", _planner_prompt(state), AgentPlan, on_token,
-                template_name="supervisor_plan", task_id=str(state.get("task_id", "")),
+                template_name="planner_agent", task_id=str(state.get("task_id", "")),
             )
             candidates.append(candidate)  # type: ignore[arg-type]
             sources.append(source)

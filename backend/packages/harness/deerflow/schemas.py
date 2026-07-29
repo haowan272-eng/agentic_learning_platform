@@ -10,9 +10,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 TaskStatus = Literal["pending", "running", "waiting_user", "completed", "failed", "cancelled"]
 NextAction = Literal["dispatch", "repair", "replan", "ask_user", "fallback", "complete"]
-ChildAgent = Literal["direct_answer_agent", "tool_agent", "research_agent", "diagnostic_agent", "practice_agent", "coach_agent"]
-SupervisorRoute = Literal["direct_answer", "tool_agent", "supervisor_plan", "learning_coach", "final_response", "fallback_response"]
-PlanRoute = Literal["approval_gate", "dispatch_research"]
+ChildAgent = Literal["answer_agent", "planner_agent", "research_agent"]
+SupervisorRoute = Literal["answer", "research"]
+PlanRoute = Literal["approval_gate", "research_agent"]
 
 
 class Artifact(TypedDict, total=False):
@@ -85,6 +85,7 @@ class AgentTaskState(TypedDict, total=False):
     route_source: str
     route_error: str | None
     tool_feedback: Annotated[dict[str, Any], operator.or_]
+    answer_draft: str
     plan: dict[str, Any]
     planning_source: str
     planner_error: str | None
@@ -93,6 +94,7 @@ class AgentTaskState(TypedDict, total=False):
     next_action: NextAction
     proposal: dict[str, Any]
     verification: dict[str, Any]
+    review: dict[str, Any]
     final_answer: str
     citations: list[dict[str, Any]]
     grounding: dict[str, Any]
@@ -252,6 +254,7 @@ class AgentTaskStateModel(RuntimeModel):
     route_source: str | None = Field(default=None, max_length=128)
     route_error: str | None = Field(default=None, max_length=4000)
     tool_feedback: dict[str, Any] = Field(default_factory=dict)
+    answer_draft: str | None = Field(default=None, max_length=64000)
     plan: dict[str, Any] = Field(default_factory=dict)
     planning_source: str | None = Field(default=None, max_length=128)
     planner_error: str | None = Field(default=None, max_length=4000)
@@ -260,6 +263,7 @@ class AgentTaskStateModel(RuntimeModel):
     next_action: NextAction | None = None
     proposal: dict[str, Any] = Field(default_factory=dict)
     verification: dict[str, Any] = Field(default_factory=dict)
+    review: dict[str, Any] = Field(default_factory=dict)
     final_answer: str | None = Field(default=None, max_length=64000)
     citations: list[dict[str, Any]] = Field(default_factory=list)
     grounding: dict[str, Any] = Field(default_factory=dict)
@@ -299,6 +303,7 @@ class NodeUpdateModel(RuntimeModel):
     route_source: str | None = Field(default=None, max_length=128)
     route_error: str | None = Field(default=None, max_length=4000)
     tool_feedback: dict[str, Any] | None = None
+    answer_draft: str | None = Field(default=None, max_length=64000)
     plan: dict[str, Any] | None = None
     goal: str | None = Field(default=None, max_length=8000)
     intent: str | None = Field(default=None, max_length=128)
@@ -309,6 +314,7 @@ class NodeUpdateModel(RuntimeModel):
     next_action: NextAction | None = None
     proposal: dict[str, Any] | None = None
     verification: dict[str, Any] | None = None
+    review: dict[str, Any] | None = None
     final_answer: str | None = Field(default=None, max_length=64000)
     citations: list[dict[str, Any]] | None = None
     grounding: dict[str, Any] | None = None

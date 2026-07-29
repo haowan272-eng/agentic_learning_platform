@@ -24,7 +24,7 @@ from deerflow.planner import (
     ProposalSection,
     ResearchTask,
     SupervisorDecision,
-    ToolAgentDecision,
+    AnswerAgentDecision,
     ToolCallSpec,
     UpgradeProposal,
     VerificationDecision,
@@ -33,6 +33,7 @@ from deerflow.planner import (
     generate_proposal,
     verify_proposal,
 )
+import deerflow.runtime as runtime
 from deerflow.runtime import build_agent_graph, run_agent_task
 from deerflow.tools import registry as tool_registry
 from deerflow.schemas import (
@@ -171,8 +172,7 @@ class TestDefaultPlan:
 
 
 class TestHappyPath:
-    """Full graph: supervisor_plan -> dispatch_research -> research_agent
-    registered-tool loop -> final_response."""
+    """Full graph: supervisor -> planner -> research -> final response."""
 
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
@@ -237,6 +237,7 @@ class TestHappyPath:
         event_types = {e["event_type"] for e in store.events}
         # Core lifecycle events emitted by graph nodes (not the run_agent_task wrapper).
         assert "plan.created" in event_types
+        assert "review.completed" in event_types
         assert "task.completed" in event_types
 
     def test_tool_calls_and_verifications_are_recorded(self):
@@ -305,7 +306,7 @@ class TestSupervisorDelegation:
         ):
             yield
 
-    def test_direct_answer_route_finishes_without_heavy_chain(self):
+    def test_answer_route_finishes_without_research_chain(self):
         from langgraph.checkpoint.memory import MemorySaver
 
         store = FakeStore()
@@ -315,8 +316,8 @@ class TestSupervisorDelegation:
             "deerflow.runtime.generate_supervisor_decision",
             return_value=(
                 SupervisorDecision(
-                    child_agents=["direct_answer_agent"],
-                    route="direct_answer",
+                    child_agents=["answer_agent"],
+                    route="answer",
                     intent="direct_chat",
                     reason="simple concept question",
                     confidence=0.9,
@@ -324,7 +325,7 @@ class TestSupervisorDelegation:
                     needs_tools=False,
                     needs_verification=False,
                     stop_after_children=True,
-                    response_mode="direct",
+                    response_mode="answer",
                 ),
                 "mock",
                 None,
@@ -339,14 +340,14 @@ class TestSupervisorDelegation:
         final = dict(graph.get_state(config).values)
         event_types = {event["event_type"] for event in store.events}
         assert final["status"] == "completed"
-        assert final["grounding"]["mode"] == "direct"
-        assert final["supervisor_decision"]["child_agents"] == ["direct_answer_agent"]
+        assert final["grounding"]["mode"] == "answer_agent"
+        assert final["supervisor_decision"]["child_agents"] == ["answer_agent"]
         assert "supervisor.delegated" in event_types
         assert len(store.plans) == 0
         assert len(store.tool_calls) == 0
         assert len(store.verifications) == 0
 
-    def test_rag_question_routes_through_tool_agent_without_rag_shortcut(self):
+    def test_rag_question_routes_through_answer_agent_without_research_upgrade(self):
         from langgraph.checkpoint.memory import MemorySaver
 
         store = FakeStore()
@@ -356,8 +357,8 @@ class TestSupervisorDelegation:
             "deerflow.runtime.generate_supervisor_decision",
             return_value=(
                 SupervisorDecision(
-                    child_agents=["tool_agent"],
-                    route="tool_agent",
+                    child_agents=["answer_agent"],
+                    route="answer",
                     intent="rag_question",
                     reason="knowledge lookup through tool agent",
                     confidence=0.92,
@@ -365,16 +366,16 @@ class TestSupervisorDelegation:
                     needs_tools=True,
                     needs_verification=False,
                     stop_after_children=True,
-                    response_mode="rag_answer",
+                    response_mode="answer",
                     query="TCP 涓夋鎻℃墜",
                 ),
                 "mock",
                 None,
             ),
         ), patch(
-            "deerflow.runtime.generate_tool_agent_decision",
+            "deerflow.runtime.generate_answer_agent_decision",
             return_value=(
-                ToolAgentDecision(
+                AnswerAgentDecision(
                     calls=[
                         ToolCallSpec(
                             call_id="tool-rag",
@@ -404,14 +405,14 @@ class TestSupervisorDelegation:
         event_agents = {event.get("agent_name") for event in store.events}
         assert final["status"] == "completed"
         assert final["grounding"]["rag_used"] is True
-        assert final["supervisor_decision"]["child_agents"] == ["tool_agent"]
+        assert final["supervisor_decision"]["child_agents"] == ["answer_agent"]
         assert "rag_retrieve" not in event_agents
-        assert "tool_agent" in event_agents
+        assert "answer_agent" in event_agents
         assert len(store.plans) == 0
         assert {call["tool_name"] for call in store.tool_calls} == {"knowledge.answer"}
         assert len(store.verifications) == 0
 
-    def test_tool_agent_executes_registered_tools_and_returns_feedback_response(self):
+    def test_answer_agent_executes_registered_tools_and_returns_feedback_response(self):
         from langgraph.checkpoint.memory import MemorySaver
 
         store = FakeStore()
@@ -421,8 +422,8 @@ class TestSupervisorDelegation:
             "deerflow.runtime.generate_supervisor_decision",
             return_value=(
                 SupervisorDecision(
-                    child_agents=["tool_agent"],
-                    route="tool_agent",
+                    child_agents=["answer_agent"],
+                    route="answer",
                     intent="rag_question",
                     reason="needs autonomous tool selection",
                     confidence=0.9,
@@ -430,16 +431,16 @@ class TestSupervisorDelegation:
                     needs_tools=True,
                     needs_verification=False,
                     stop_after_children=True,
-                    response_mode="rag_answer",
+                    response_mode="answer",
                     query="TCP 涓夋鎻℃墜",
                 ),
                 "mock",
                 None,
             ),
         ), patch(
-            "deerflow.runtime.generate_tool_agent_decision",
+            "deerflow.runtime.generate_answer_agent_decision",
             return_value=(
-                ToolAgentDecision(
+                AnswerAgentDecision(
                     calls=[
                         ToolCallSpec(
                             call_id="tool-1",
@@ -468,13 +469,52 @@ class TestSupervisorDelegation:
         final = dict(graph.get_state(config).values)
         event_types = {event["event_type"] for event in store.events}
         assert final["status"] == "completed"
-        assert final["supervisor_decision"]["child_agents"] == ["tool_agent"]
+        assert final["supervisor_decision"]["child_agents"] == ["answer_agent"]
         assert final["tool_feedback"]["success_count"] == 1
         assert final["tool_feedback"]["next_action"] == "complete"
-        assert "tool.agent_decided" in event_types
-        assert "tool.feedback_ready" in event_types
+        assert "answer.agent_decided" in event_types
+        assert "answer.feedback_ready" in event_types
         assert len(store.tool_calls) == 1
         assert len(store.verifications) == 0
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_goto"),
+    [
+        ({"action": "approve"}, "research_agent"),
+        ({"action": "edit", "user_input": "revise the plan"}, "planner_agent"),
+        ({"action": "reject"}, "fallback_response"),
+    ],
+)
+def test_approval_gate_routes_only_to_the_clean_research_chain(monkeypatch, decision, expected_goto):
+    store = FakeStore()
+    state = _make_base_state(plan={"goal": "test", "approval_required": True})
+    monkeypatch.setattr(runtime, "interrupt", lambda _request: decision)
+    with patch("deerflow.runtime.append_recent_event"), patch("deerflow.runtime.publish_task_event"):
+        command = runtime._approval_gate(state, store)
+
+    assert command.goto == expected_goto
+
+
+@pytest.mark.parametrize(
+    ("verification", "proposal", "expected_outcome", "expected_route"),
+    [
+        ({"status": "passed"}, {"summary": "ready"}, "approved", "final_response"),
+        ({"status": "needs_approval"}, {"summary": "needs input"}, "needs_confirmation", "approval_gate"),
+        ({"status": "fallback"}, {}, "rejected", "fallback_response"),
+    ],
+)
+def test_review_agent_controls_publication_without_tool_calls(
+    verification, proposal, expected_outcome, expected_route,
+):
+    store = FakeStore()
+    state = _make_base_state(verification=verification, proposal=proposal)
+    with patch("deerflow.runtime.append_recent_event"), patch("deerflow.runtime.publish_task_event"):
+        update = runtime._review_agent(state, store)
+
+    assert update["review"]["outcome"] == expected_outcome
+    assert runtime._review_agent_route({**state, **update}) == expected_route
+    assert {event["agent_name"] for event in store.events} == {"review_agent"}
 
 
 # 鈹€鈹€ repair loop E2E 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -882,8 +922,8 @@ class TestAgentTaskStateInvariants:
     def test_supervisor_decision_rejects_mismatched_child_agents(self):
         with pytest.raises(ValidationError):
             SupervisorDecision(
-                child_agents=["tool_agent"],
-                route="direct_answer",
+                child_agents=["research_agent"],
+                route="answer",
                 intent="direct_chat",
                 reason="invalid mixed route",
                 confidence=0.9,
@@ -891,13 +931,13 @@ class TestAgentTaskStateInvariants:
                 needs_tools=False,
                 needs_verification=False,
                 stop_after_children=True,
-                response_mode="direct",
+                response_mode="answer",
             )
 
-    def test_supervisor_decision_accepts_tool_agent_route_contract(self):
+    def test_supervisor_decision_accepts_answer_route_contract(self):
         decision = SupervisorDecision(
-            child_agents=["tool_agent"],
-            route="tool_agent",
+            child_agents=["answer_agent"],
+            route="answer",
             intent="rag_question",
             reason="valid tool agent route",
             confidence=0.9,
@@ -905,11 +945,11 @@ class TestAgentTaskStateInvariants:
             needs_tools=True,
             needs_verification=False,
             stop_after_children=True,
-            response_mode="rag_answer",
+            response_mode="answer",
             query="TCP handshake",
         )
 
-        assert decision.child_agents == ["tool_agent"]
+        assert decision.child_agents == ["answer_agent"]
 
     def test_minimal_state_is_accepted_by_graph_builder(self):
         from langgraph.checkpoint.memory import MemorySaver

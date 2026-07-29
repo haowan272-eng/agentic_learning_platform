@@ -5,7 +5,7 @@ from deerflow.planner import default_plan, default_supervisor_decision
 from deerflow.tools import call_tool, list_tools
 
 
-def test_fallback_supervisor_plan_contains_parallel_research_tasks():
+def test_fallback_planner_contains_parallel_research_tasks():
     plan = default_plan({"user_input": "评估并升级我的 Agent 工作流", "task_type": "project_upgrade"})
 
     assert len(plan.research_tasks) >= 2
@@ -50,10 +50,10 @@ def test_business_scenario_routes_to_verified_agent_workflow():
         }
     )
 
-    assert decision.route == "supervisor_plan"
+    assert decision.route == "research"
     assert decision.needs_rag is True
     assert decision.needs_verification is True
-    assert decision.child_agents == ["research_agent"]
+    assert decision.child_agents == ["planner_agent", "research_agent"]
 
 
 def test_learning_scenario_blueprint_tool_is_registered_and_allowed():
@@ -63,7 +63,7 @@ def test_learning_scenario_blueprint_tool_is_registered_and_allowed():
     result = call_tool(
         "learning.scenario_blueprint",
         {"scenario_key": "technical_mock_30m"},
-        agent="tool_agent",
+        agent="answer_agent",
     )
 
     assert result["ok"] is True

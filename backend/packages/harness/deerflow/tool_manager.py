@@ -47,7 +47,6 @@ def _trusted_args(state: dict[str, Any], tool_name: str, arguments: dict[str, An
         args["document_id"] = state.get("document_id")
         args["conversation_id"] = state.get("conversation_id")
         args.setdefault("top_k", 5)
-        args.setdefault("use_memory", True)
         args.setdefault("rewrite_query", True)
     if tool_name.startswith(("architecture.", "verification.", "planning.")):
         args["user_input"] = state.get("user_input", "")

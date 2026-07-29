@@ -4,6 +4,7 @@ from typing import Any
 
 import deerflow.tools as tools
 from deerflow.tools import call_tool, list_tools
+from deerflow.tool_permissions import assert_tool_allowed
 
 
 class FakeGitHubResponse:
@@ -32,7 +33,7 @@ def test_github_search_tool_is_registered() -> None:
     assert "github.read_readme" in tool_names
 
 
-def test_tool_agent_can_search_github_repositories(monkeypatch) -> None:
+def test_answer_agent_can_search_github_repositories(monkeypatch) -> None:
     _disable_github_cache(monkeypatch)
 
     def fake_get(url: str, *, headers: dict[str, str], params: dict[str, Any] | None = None, timeout: float = 15.0):
@@ -61,7 +62,7 @@ def test_tool_agent_can_search_github_repositories(monkeypatch) -> None:
     result = call_tool(
         "github.search_repositories",
         {"query": "langgraph learning agent", "limit": 1},
-        agent="tool_agent",
+        agent="answer_agent",
     )
 
     assert result["ok"] is True
@@ -72,7 +73,7 @@ def test_tool_agent_can_search_github_repositories(monkeypatch) -> None:
     assert result["citations"][0]["url"] == "https://github.com/langchain-ai/langgraph"
 
 
-def test_tool_agent_can_read_github_readme(monkeypatch) -> None:
+def test_answer_agent_can_read_github_readme(monkeypatch) -> None:
     _disable_github_cache(monkeypatch)
 
     def fake_get(url: str, *, headers: dict[str, str], params: dict[str, Any] | None = None, timeout: float = 15.0):
@@ -86,7 +87,7 @@ def test_tool_agent_can_read_github_readme(monkeypatch) -> None:
     result = call_tool(
         "github.read_readme",
         {"repo": "langchain-ai/langgraph", "max_chars": 1000},
-        agent="tool_agent",
+        agent="answer_agent",
     )
 
     assert result["ok"] is True
@@ -94,11 +95,8 @@ def test_tool_agent_can_read_github_readme(monkeypatch) -> None:
     assert result["grounding"]["repo"] == "langchain-ai/langgraph"
 
 
-def test_research_agent_cannot_call_github_tools() -> None:
-    result = call_tool("github.read_readme", {"repo": "langchain-ai/langgraph"}, agent="research_agent")
-
-    assert result["ok"] is False
-    assert result["error"]["type"] == "tool_permission_denied"
+def test_research_agent_can_read_github_readme() -> None:
+    assert assert_tool_allowed("research_agent", "github.read_readme").agent == "research_agent"
 
 
 def test_github_search_failure_returns_structured_tool_result(monkeypatch) -> None:
@@ -109,7 +107,7 @@ def test_github_search_failure_returns_structured_tool_result(monkeypatch) -> No
 
     monkeypatch.setattr(tools.httpx, "get", fake_get)
 
-    result = call_tool("github.search_repositories", {"query": "langgraph", "limit": 1}, agent="tool_agent")
+    result = call_tool("github.search_repositories", {"query": "langgraph", "limit": 1}, agent="answer_agent")
 
     assert result["ok"] is False
     assert result["data"]["repositories"] == []

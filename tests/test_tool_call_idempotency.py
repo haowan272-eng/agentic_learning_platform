@@ -41,7 +41,7 @@ def test_managed_tool_replays_a_completed_call_without_reexecuting(monkeypatch) 
         store,
         tool_name="knowledge.answer",
         arguments={"query": "idempotency"},
-        agent_name="tool_agent",
+        agent_name="answer_agent",
         skill_name="test",
         call_id="call-1",
     )
@@ -50,7 +50,7 @@ def test_managed_tool_replays_a_completed_call_without_reexecuting(monkeypatch) 
         store,
         tool_name="knowledge.answer",
         arguments={"query": "idempotency"},
-        agent_name="tool_agent",
+        agent_name="answer_agent",
         skill_name="test",
         call_id="call-1",
     )

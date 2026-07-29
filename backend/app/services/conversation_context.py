@@ -16,7 +16,6 @@ from app.core.config import (
     RAG_MEMORY_TASK_STATE_MAX_TOKENS,
 )
 from app.models import RagConversation, RagMessage
-from app.services.short_term_memory import load_short_term_messages
 from app.services.token_budget import count_tokens, fit_recent_lines, truncate_tokens
 
 
@@ -354,14 +353,19 @@ def build_conversation_context(
 
     recent = []
     if RAG_HISTORY_MESSAGES:
-        recent = load_short_term_messages(
-            db,
-            conversation.user_id,
-            conversation.id,
-            limit=RAG_HISTORY_MESSAGES,
+        recent_rows = (
+            db.query(RagMessage)
+            .filter(RagMessage.conversation_id == conversation.id)
+            .order_by(RagMessage.id.desc())
+            .limit(RAG_HISTORY_MESSAGES)
+            .all()
         )
         checkpoint = conversation.summary_until_message_id or 0
-        recent = [row for row in recent if row["message_id"] > checkpoint]
+        recent = [
+            {"message_id": row.id, "role": row.role, "content": row.content}
+            for row in reversed(recent_rows)
+            if row.id > checkpoint
+        ]
     state = _task_state(state_messages)
     try:
         previous_state = json.loads(conversation.task_state_json or "{}")

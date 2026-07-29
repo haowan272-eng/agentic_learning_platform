@@ -222,7 +222,6 @@ const state = reactive({
   query: modes[0].prompt,
   topK: 6,
   bm25Weight: 0.4,
-  useMemory: true,
   rewriteQuery: true,
   answer: null as AnswerResponse | null,
   routeDecision: null as RouteDecision | null,
@@ -772,7 +771,6 @@ async function askRag() {
     conversation_id: state.conversationId || undefined,
     top_k: Number(state.topK),
     bm25_weight: Number(state.bm25Weight),
-    use_memory: state.useMemory,
     rewrite_query: state.rewriteQuery
   };
   state.answer = emptyAnswer(payload);
@@ -1228,7 +1226,7 @@ onUnmounted(() => {
               <div class="control-grid">
                 <label><span>Top K</span><input v-model.number="state.topK" type="number" min="1" max="20" /></label>
                 <label><span>BM25 权重</span><input v-model.number="state.bm25Weight" type="number" min="0" max="1" step="0.1" /></label>
-                <label class="toggle"><input v-model="state.useMemory" type="checkbox" />启用记忆</label>
+                <!-- RAG memory toggle removed; memory is now managed exclusively by the Agent runtime. -->
                 <label class="toggle"><input v-model="state.rewriteQuery" type="checkbox" />改写问题</label>
               </div>
               <div class="panel-actions">

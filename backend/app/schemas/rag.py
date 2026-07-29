@@ -1,4 +1,4 @@
-"""RAG 回答接口数据契约——请求/响应/引用/记忆结果的 Pydantic 模型。"""
+"""RAG 回答接口数据契约——请求/响应/引用结果的 Pydantic 模型。"""
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -11,7 +11,6 @@ class AnswerRequest(BaseModel):
     kb_id: Optional[int] = None
     bm25_weight: float = Field(default=0.4, ge=0.0, le=1.0)
     conversation_id: Optional[int] = None
-    use_memory: bool = True
     rewrite_query: bool = True
 
 
@@ -29,12 +28,6 @@ class CitationResult(BaseModel):
     location: Optional[str] = None
     score: float
     quote: str
-
-
-class MemoryResult(BaseModel):
-    keyword: str
-    category: str
-    weight: float
 
 
 class WarningResult(BaseModel):
@@ -57,7 +50,6 @@ class AnswerResponse(BaseModel):
     retrieved_contexts: list[str]
     retrieved_sources: list[RetrievedSourceResult]
     retrieved_count: int
-    memory_used: list[MemoryResult]
     degraded: bool = False
     warnings: list[WarningResult] = Field(default_factory=list)
     context_compacted: bool = False

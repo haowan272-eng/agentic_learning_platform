@@ -139,7 +139,7 @@ def run_document_index(
         from app.rag.vectorstore import get_qdrant_store
 
         embedder = get_embedder()
-        pipeline_hash = get_qdrant_store().compute_pipeline_hash(
+        indexing_config_hash = get_qdrant_store().compute_indexing_config_hash(
             chunk_size=chunk_size,
             chunk_overlap=overlap,
             model_name=embedder.model_name,
@@ -177,7 +177,7 @@ def run_document_index(
         document.status = "indexed"
         document.source_retained = True
         document.error_message = None
-        document.pipeline_version = pipeline_hash
+        document.pipeline_version = indexing_config_hash
         db.commit()
         store_doc_index_progress(
             document_id,
@@ -191,7 +191,7 @@ def run_document_index(
             "document_id": document_id,
             "chunks": len(chunks),
             "embeddings": embedding_count,
-            "pipeline_version": pipeline_hash,
+            "pipeline_version": indexing_config_hash,
         }
     except Exception:
         db.rollback()

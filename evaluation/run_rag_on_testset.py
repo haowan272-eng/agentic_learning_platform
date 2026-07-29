@@ -133,7 +133,6 @@ def call_rag(
         "query": question,
         "top_k": top_k,
         "bm25_weight": bm25_weight,
-        "use_memory": False,
         "rewrite_query": rewrite_query,
     }
     if kb_id is not None:
