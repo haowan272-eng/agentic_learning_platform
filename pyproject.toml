@@ -28,6 +28,7 @@ dependencies = [
   "langgraph>=1.1,<2",
   "langgraph-checkpoint-postgres>=3.0.0",
   "httpx>=0.28.0",
+  "ddgs>=9.0.0",
   "redis>=5.0.0",
   "hiredis>=2.0.0",
   "celery[redis]>=5.4.0",
@@ -51,3 +52,4 @@ package = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["backend", "backend/packages/harness"]

@@ -14,8 +14,8 @@ from sqlalchemy.pool import StaticPool
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["APP_ENV"] = "test"
 os.environ["DATABASE_URL"] = "sqlite://"
-os.environ["SECRET_KEY"] = "test-access-secret-key-at-least-32-bytes"
-os.environ["REFRESH_SECRET_KEY"] = "test-refresh-secret-key-at-least-32-bytes"
+os.environ["SECRET_KEY"] = "test-access-secret-key-at-least-64-bytes-for-config-validation-123"
+os.environ["REFRESH_SECRET_KEY"] = "test-refresh-secret-key-at-least-64-bytes-for-config-validation-123"
 
 from app.core.config import ALGORITHM, SECRET_KEY  # noqa: E402
 from app.core.database import Base, get_db  # noqa: E402

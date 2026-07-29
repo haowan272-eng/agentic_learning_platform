@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.agent_runtime.planner import default_plan
+from deerflow.planner import default_plan
 from app.memory.events import sanitize_memory_content
 
 

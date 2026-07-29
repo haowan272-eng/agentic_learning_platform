@@ -43,7 +43,9 @@ import {
   reindexDocument,
   register,
   streamAgentEvents,
+  AUTH_INVALID_EVENT,
   tokenStore,
+  updateLearningProfile,
   uploadDocument,
   type AnswerQuestionPayload,
   type AgentEvent,
@@ -64,9 +66,14 @@ type Mode = {
   label: string;
   prompt: string;
   helper: string;
+  taskType: string;
+  agentGoal: string;
+  ragFirst: boolean;
+  outputs: string[];
 };
 
 type LearningRoute = "question_answering" | "learning_system_design" | "clarify";
+type NavPanel = "workspace" | "sources" | "agent";
 
 type RouteDecision = {
   route: LearningRoute;
@@ -77,31 +84,102 @@ type RouteDecision = {
   planningGoal?: string;
 };
 
+type ProfileOption = {
+  key: string;
+  label: string;
+  helper: string;
+};
+
 const modes: Mode[] = [
   {
-    key: "deep-dive",
-    label: "知识深挖",
-    helper: "把简历或岗位要求拆成高频追问",
-    prompt: "请基于我的知识库，围绕这个面试主题生成 5 个高质量追问，并给出每题的答题结构："
+    key: "jd_interview_prep",
+    label: "JD 面试准备",
+    helper: "拆 JD、匹配简历证据、生成追问优先级",
+    taskType: "scenario_jd_interview_prep",
+    agentGoal: "围绕目标 JD 建立面试准备闭环，输出岗位要求、简历证据、风险追问和训练优先级。",
+    ragFirst: true,
+    outputs: ["JD 拆解", "证据匹配", "追问清单"],
+    prompt: "请针对下面这份 JD 做面试准备：先拆岗位能力要求，再结合我的简历/项目材料找证据和缺口，最后给出高频追问与回答框架。\n\nJD/目标岗位："
   },
   {
-    key: "mock",
-    label: "模拟面试",
-    helper: "先问后评，训练表达闭环",
-    prompt: "请扮演资深面试官，基于知识库对我进行模拟面试。先提出一个问题，然后说明优秀回答应覆盖哪些点："
+    key: "project_deep_dive",
+    label: "项目深挖追问",
+    helper: "围绕项目事实、取舍、边界做追问树",
+    taskType: "scenario_project_deep_dive",
+    agentGoal: "针对一个项目生成面试官深挖路径，覆盖背景、方案、难点、取舍、指标和风险边界。",
+    ragFirst: true,
+    outputs: ["事实线", "追问树", "回答稿"],
+    prompt: "请针对下面这个项目做深挖追问：提取项目事实线，生成从基础到高压的技术追问树，并给出 3 分钟项目回答稿。\n\n项目描述/项目名："
   },
   {
-    key: "gap",
-    label: "能力补差",
-    helper: "定位薄弱点并生成复习路线",
-    prompt: "请根据我的目标岗位和知识库，找出我目前最需要补齐的知识点，并按优先级给出学习建议："
+    key: "knowledge_ladder_5x",
+    label: "5 轮知识追问",
+    helper: "从概念到项目迁移，做递进式追问",
+    taskType: "scenario_knowledge_ladder_5x",
+    agentGoal: "围绕单个知识点设计 5 轮递进追问，逐轮提升深度并连接项目证据。",
+    ragFirst: true,
+    outputs: ["5 轮问题", "考察点", "误区"],
+    prompt: "请围绕下面这个知识点做 5 轮递进追问：每轮说明考察点、优秀回答骨架、常见误区，并在最后连接到项目场景。\n\n知识点："
   },
   {
-    key: "resume",
-    label: "项目复盘",
-    helper: "把项目经历转成可讲清的面试故事",
-    prompt: "请基于我的项目资料，帮我整理一段适合面试表达的 STAR 项目复盘，并列出可能被追问的问题："
+    key: "resume_star_rewrite",
+    label: "项目 STAR 改造",
+    helper: "把简历项目改成可讲、可信、可量化表达",
+    taskType: "scenario_resume_star_rewrite",
+    agentGoal: "将简历项目改造成 STAR 表达，补齐情境、任务、行动、结果和量化证据。",
+    ragFirst: true,
+    outputs: ["STAR 拆解", "简历 bullet", "口述稿"],
+    prompt: "请把下面的简历项目改造成 STAR 表达：指出证据缺口，改写成简历 bullet，并给出面试口述稿。\n\n原项目描述："
+  },
+  {
+    key: "technical_mock_30m",
+    label: "30 分钟技术面",
+    helper: "生成完整面试议程、问题、评分和复盘",
+    taskType: "scenario_technical_mock_30m",
+    agentGoal: "模拟一场 30 分钟技术面，按开场、项目、知识、系统设计、收尾组织问题与评分。",
+    ragFirst: true,
+    outputs: ["面试议程", "分阶段问题", "Rubric"],
+    prompt: "请模拟一场 30 分钟技术面：按时间段生成问题、追问策略、评分 Rubric 和复盘建议。\n\n目标岗位/希望考察方向："
+  },
+  {
+    key: "weekly_training_plan",
+    label: "下周训练计划",
+    helper: "结合历史回答和薄弱点安排 7 天训练",
+    taskType: "scenario_weekly_training_plan",
+    agentGoal: "根据历史回答、weakness 和当前目标生成下一周训练计划，包含每日练习与验收指标。",
+    ragFirst: false,
+    outputs: ["7 天日历", "练习题", "复盘指标"],
+    prompt: "请根据我的历史回答、已有 weakness 和当前目标，生成下一周训练计划。请说明每日训练主题、练习题、复盘指标和复习间隔。\n\n目标/约束："
   }
+];
+
+const interviewCapabilityTitles = ["知识理解", "项目表达", "追问应对", "系统设计", "沟通表达", "岗位匹配"];
+const interviewScopeSignals = ["简历", "resume", "cv", "jd", "岗位", "职位", "面试", "项目经历", "项目资料"];
+const interviewIntentSignals = ["提升", "提优", "诊断", "薄弱", "weakness", "不足", "复盘", "总结", "追问", "模拟", "准备", "匹配", "能力", "评价", "评估", "练习"];
+
+const candidateStageOptions: ProfileOption[] = [
+  { key: "fresh_graduate", label: "应届生", helper: "校招、实习转正、秋招/春招准备" },
+  { key: "experienced", label: "社招", helper: "跳槽、晋升、专项岗位面试" },
+  { key: "career_switcher", label: "转岗/转行", helper: "补齐基础并重塑项目表达" }
+];
+
+const targetRoleOptions: ProfileOption[] = [
+  { key: "backend", label: "后端工程师", helper: "Java / Go / Python / 架构设计" },
+  { key: "frontend", label: "前端工程师", helper: "框架、工程化、性能与体验" },
+  { key: "algorithm", label: "算法工程师", helper: "数据结构、算法题、复杂度分析" },
+  { key: "ai_engineer", label: "AI 工程师", helper: "RAG、Agent、模型应用与评估" },
+  { key: "product_manager", label: "产品经理", helper: "需求分析、方案表达、业务判断" }
+];
+
+const prepGoalOptions: ProfileOption[] = [
+  { key: "knowledge_drill", label: "刷八股", helper: "高频知识点、原理追问、体系化复习" },
+  { key: "project_story", label: "项目表达", helper: "STAR 复盘、技术亮点、难点取舍" },
+  { key: "jd_mock", label: "针对 JD 模拟面试", helper: "岗位匹配、简历追问、面试官视角演练" }
+];
+
+const timelineOptions: ProfileOption[] = [
+  { key: "short_sprint", label: "短期冲刺", helper: "1-4 周集中准备，优先面试通过率" },
+  { key: "long_term_growth", label: "长期学习提升", helper: "持续补短板，沉淀能力地图和练习闭环" }
 ];
 
 const auth = reactive({
@@ -111,6 +189,16 @@ const auth = reactive({
   loading: false,
   error: "",
   notice: ""
+});
+
+const profileForm = reactive({
+  candidateStage: "",
+  targetRoles: [] as string[],
+  prepGoals: [] as string[],
+  timeline: "",
+  targetJd: "",
+  loading: false,
+  error: ""
 });
 
 const state = reactive({
@@ -127,8 +215,10 @@ const state = reactive({
   reviews: [] as LearningReviewItem[],
   selectedKbId: 0,
   selectedDocId: 0,
+  activePanel: "workspace" as NavPanel,
   newKbName: "面试提优资料库",
   newKbDescription: "简历、岗位 JD、项目复盘、八股笔记与模拟面试记录。",
+  newKbVisibility: "private" as "private" | "shared",
   query: modes[0].prompt,
   topK: 6,
   bm25Weight: 0.4,
@@ -145,11 +235,19 @@ const state = reactive({
   taskBusy: false,
   agentStreaming: false,
   learningBusy: false,
+  bootstrapping: Boolean(tokenStore.access()),
   error: ""
 });
 
 const isAuthed = computed(() => Boolean(state.token));
+const hasCompletedProfile = computed(() => Boolean(state.learningProfile?.preferences?.profile_completed));
+const needsOnboarding = computed(() => isAuthed.value && !state.bootstrapping && !hasCompletedProfile.value);
 const selectedKb = computed(() => state.kbs.find((kb) => kb.id === state.selectedKbId));
+const selectedKbCanUpload = computed(() => !selectedKb.value || selectedKb.value.can_upload);
+const selectedKbScopeLabel = computed(() => {
+  if (!selectedKb.value) return "私人文档";
+  return selectedKb.value.visibility === "shared" ? "共享知识库" : "私人知识库";
+});
 const selectedDoc = computed(() => state.docs.find((doc) => doc.id === state.selectedDocId));
 const activeTask = computed(() => state.tasks[0]);
 const readyDocs = computed(() => state.docs.filter((doc) => isIndexedStatus(effectiveDocStatus(doc))).length);
@@ -210,6 +308,61 @@ function progressLabel(progress: DocumentProgress) {
   return labels[progress.status] ?? progress.status;
 }
 
+function optionLabel(options: ProfileOption[], key: string) {
+  return options.find((item) => item.key === key)?.label ?? key;
+}
+
+function selectPanel(panel: NavPanel) {
+  state.activePanel = panel;
+}
+
+function toggleProfileValue(list: string[], key: string) {
+  const index = list.indexOf(key);
+  if (index >= 0) list.splice(index, 1);
+  else list.push(key);
+}
+
+function buildProfileSummary() {
+  const stage = optionLabel(candidateStageOptions, profileForm.candidateStage);
+  const roles = profileForm.targetRoles.map((key) => optionLabel(targetRoleOptions, key)).join("、");
+  const goals = profileForm.prepGoals.map((key) => optionLabel(prepGoalOptions, key)).join("、");
+  const timeline = optionLabel(timelineOptions, profileForm.timeline);
+  return `${stage}｜目标：${roles}｜当前重点：${goals}｜节奏：${timeline}`;
+}
+
+async function submitUserProfile() {
+  profileForm.error = "";
+  if (!profileForm.candidateStage || !profileForm.targetRoles.length || !profileForm.prepGoals.length || !profileForm.timeline) {
+    profileForm.error = "请至少选择身份阶段、目标方向、准备重点和学习节奏。";
+    return;
+  }
+  profileForm.loading = true;
+  try {
+    const saved = await updateLearningProfile({
+      target_role: profileForm.targetRoles.map((key) => optionLabel(targetRoleOptions, key)).join("、"),
+      goal: buildProfileSummary(),
+      current_level: profileForm.candidateStage,
+      weekly_minutes: profileForm.timeline === "short_sprint" ? 600 : 300,
+      preferences: {
+        ...(state.learningProfile?.preferences ?? {}),
+        profile_completed: true,
+        candidate_stage: profileForm.candidateStage,
+        target_roles: [...profileForm.targetRoles],
+        preparation_goals: [...profileForm.prepGoals],
+        learning_timeline: profileForm.timeline,
+        target_jd: profileForm.targetJd.trim(),
+        onboarding_version: 1
+      }
+    });
+    state.learningProfile = saved;
+    await bootstrap();
+  } catch (error) {
+    profileForm.error = messageFromError(error, "画像保存失败。");
+  } finally {
+    profileForm.loading = false;
+  }
+}
+
 function upsertAgentEvent(event: AgentEvent) {
   const index = state.events.findIndex((item) => item.event_index === event.event_index);
   if (index >= 0) state.events[index] = event;
@@ -268,6 +421,7 @@ function emptyAnswer(payload: AnswerQuestionPayload): AnswerResponse {
     citations: [],
     retrieved_count: 0,
     degraded: false,
+    warnings: [],
     context_compacted: false,
     timings_ms: {}
   };
@@ -349,11 +503,23 @@ function logout() {
   state.practices = [];
   state.reviews = [];
   state.answer = null;
+  state.bootstrapping = false;
+}
+
+function handleAuthInvalid(event: Event) {
+  const message = event instanceof CustomEvent && typeof event.detail === "string" ? event.detail : "Invalid token";
+  logout();
+  auth.error = message === "AUTH_TOKEN_EXPIRED" ? "登录已过期，请重新登录。" : "登录状态无效，请重新登录。";
 }
 
 async function bootstrap() {
   state.error = "";
-  await Promise.all([refreshKbs(), refreshTasks(), refreshLearning()]);
+  state.bootstrapping = true;
+  try {
+    await Promise.all([refreshKbs(), refreshTasks(), refreshLearning()]);
+  } finally {
+    state.bootstrapping = false;
+  }
 }
 
 async function refreshLearning() {
@@ -381,7 +547,7 @@ async function refreshLearning() {
 
 async function refreshKbs() {
   state.kbs = await listKnowledgeBases();
-  if (!state.selectedKbId && state.kbs.length) state.selectedKbId = state.kbs[0].id;
+  if (state.selectedKbId && !state.kbs.some((kb) => kb.id === state.selectedKbId)) state.selectedKbId = 0;
   await refreshDocs();
 }
 
@@ -428,7 +594,11 @@ async function addKb() {
   if (!state.newKbName.trim()) return;
   state.busy = true;
   try {
-    const kb = await createKnowledgeBase(state.newKbName.trim(), state.newKbDescription.trim());
+    const kb = await createKnowledgeBase(
+      state.newKbName.trim(),
+      state.newKbDescription.trim(),
+      state.newKbVisibility
+    );
     state.kbs.unshift(kb);
     state.selectedKbId = kb.id;
     await refreshDocs();
@@ -443,6 +613,11 @@ async function onUpload(event: Event) {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
   if (!file) return;
+  if (!selectedKbCanUpload.value) {
+    state.error = "当前账号没有向共享知识库上传的权限，请切回个人文档或使用管理员账号。";
+    input.value = "";
+    return;
+  }
   state.uploading = true;
   state.error = "";
   try {
@@ -465,12 +640,30 @@ function selectMode(mode: Mode) {
   state.query = `${mode.prompt}\n\n`;
 }
 
-function routeLearningRequest(input: string): RouteDecision {
+function isInterviewCapabilityInput(input: string) {
+  const normalized = input.trim().toLowerCase();
+  if (!normalized) return false;
+  const hasCapabilityTitle = interviewCapabilityTitles.some((item) => normalized.includes(item.toLowerCase()));
+  const hasScope = interviewScopeSignals.some((item) => normalized.includes(item.toLowerCase()));
+  const hasIntent = interviewIntentSignals.some((item) => normalized.includes(item.toLowerCase()));
+  return hasCapabilityTitle || (hasScope && hasIntent);
+}
+
+function routeLearningRequest(input: string, scenario: Mode = state.selectedMode): RouteDecision {
   const text = input.trim();
   const normalized = text.toLowerCase();
+  if (scenario.taskType.startsWith("scenario_")) {
+    return {
+      route: "learning_system_design",
+      label: scenario.label,
+      reason: `一级业务场景「${scenario.label}」会直接进入 Agent 场景流程：${scenario.agentGoal}`,
+      confidence: 0.94,
+      planningGoal: text
+    };
+  }
   const planningSignals = [
     "提升", "规划", "计划", "路线", "学习路径", "诊断", "薄弱", "练习", "训练", "模拟",
-    "复盘", "批改", "评价我的", "帮我准备", "怎么学", "安排", "制定",
+    "复盘", "批改", "评价我的", "帮我准备", "怎么学", "安排", "制定", "简历", "岗位匹配",
     "improve", "plan", "roadmap", "practice", "diagnose", "mock", "review", "coach"
   ];
   const questionSignals = [
@@ -488,6 +681,15 @@ function routeLearningRequest(input: string): RouteDecision {
     };
   }
   if (hasPlanningIntent) {
+    if (isInterviewCapabilityInput(text)) {
+      return {
+        route: "learning_system_design",
+        label: "RAG 首答 + Agent 提优",
+        reason: "请求涉及简历/JD面试诊断，会先用 RAG 按能力模型总结并标记 weakness，再进入 Agent 后续流程。",
+        confidence: 0.88,
+        planningGoal: text
+      };
+    }
     return {
       route: "learning_system_design",
       label: "学习提升任务",
@@ -519,7 +721,7 @@ async function submitLearningRequest() {
   state.routeBusy = true;
   state.error = "";
   state.answer = null;
-  state.routeDecision = routeLearningRequest(state.query);
+  state.routeDecision = routeLearningRequest(state.query, state.selectedMode);
   try {
     if (state.routeDecision.route === "clarify") {
       state.error = state.routeDecision.reason;
@@ -528,6 +730,11 @@ async function submitLearningRequest() {
     if (state.routeDecision.route === "question_answering") {
       await askRag();
       return;
+    }
+    if (state.selectedMode.ragFirst || isInterviewCapabilityInput(state.query)) {
+      await askRag();
+      if (state.error || !state.answer) return;
+      await refreshLearning();
     }
     await startLearningAgentTask();
   } finally {
@@ -592,6 +799,7 @@ async function askRag() {
     await typewriter.stop();
     state.answer = result;
     state.conversationId = result.conversation_id;
+    await refreshLearning();
   } catch (error) {
     await typewriter.stop();
     state.error = messageFromError(error, "问答失败。");
@@ -602,13 +810,19 @@ async function askRag() {
 
 async function startAgentReview() {
   const input = state.answer
-    ? `请基于当前 RAG 问答结果，为我生成一份面试提优反馈：指出回答亮点、薄弱点、追问清单和下一轮训练建议。\n\n问题：${state.answer.query}\n\n回答：${state.answer.answer}`
-    : `请基于知识库「${selectedKb.value?.name ?? "当前资料"}」生成一轮面试提优训练计划，包含知识盲区、模拟问题和复习优先级。`;
+    ? `业务场景：${state.selectedMode.label}\n场景目标：${state.selectedMode.agentGoal}\n\n请基于当前 RAG 问答结果，按知识理解、项目表达、追问应对、系统设计、沟通表达、岗位匹配生成面试提优反馈：指出回答亮点、weakness、追问清单和下一轮训练建议。\n\n问题：${state.answer.query}\n\n回答：${state.answer.answer}`
+    : `业务场景：${state.selectedMode.label}\n场景目标：${state.selectedMode.agentGoal}\n\n请基于知识库「${selectedKb.value?.name ?? "当前资料"}」生成场景化面试提优方案，包含 weakness、模拟问题和复习优先级。`;
   state.taskBusy = true;
   state.error = "";
   try {
     const task = await createAgentTask({
       user_input: input,
+      task_type: state.selectedMode.taskType,
+      scenario_key: state.selectedMode.key,
+      scenario_inputs: {
+        selected_outputs: state.selectedMode.outputs,
+        raw_query: state.query.trim()
+      },
       kb_id: state.selectedKbId || undefined,
       conversation_id: state.conversationId || undefined,
       max_steps: 8,
@@ -626,17 +840,31 @@ async function startAgentReview() {
 
 async function startLearningAgentTask() {
   const input = [
-    "主 Agent 已判断这是学习提升/系统规划设计任务。",
-    "请围绕用户目标制定计划，并按需分发给 diagnostic_agent、research_agent、practice_agent、coach_agent 等子 Agent。",
+    `一级业务场景：${state.selectedMode.label}`,
+    `场景目标：${state.selectedMode.agentGoal}`,
+    `预期交付：${state.selectedMode.outputs.join("、")}`,
     "",
-    `用户目标：${state.query.trim()}`
+    "主 Agent 已判断这是场景化学习提升/系统规划设计任务。",
+    "如果上方已有 RAG 首答，请把它作为已完成的第一次回答与 weakness 证据继续推进；否则先检索知识库。",
+    "请先读取或遵循该业务场景蓝图，再围绕知识理解、项目表达、追问应对、系统设计、沟通表达、岗位匹配制定后续完整 Agent 流程。",
+    "",
+    `用户目标：${state.query.trim()}`,
+    state.answer
+      ? `\n首轮 RAG 问题：${state.answer.query}\n首轮 RAG 回答：${state.answer.answer.slice(0, 1800)}`
+      : ""
   ].join("\n");
   state.taskBusy = true;
   state.error = "";
   try {
     const task = await createAgentTask({
       user_input: input,
-      task_type: "learning_coach",
+      task_type: state.selectedMode.taskType,
+      scenario_key: state.selectedMode.key,
+      scenario_inputs: {
+        selected_outputs: state.selectedMode.outputs,
+        rag_first: state.selectedMode.ragFirst,
+        raw_query: state.query.trim()
+      },
       kb_id: state.selectedKbId || undefined,
       document_id: state.selectedDocId || undefined,
       conversation_id: state.conversationId || undefined,
@@ -683,12 +911,14 @@ async function cancelActiveTask() {
 }
 
 onMounted(() => {
+  window.addEventListener(AUTH_INVALID_EVENT, handleAuthInvalid);
   if (state.token) void bootstrap().catch((error) => {
     state.error = messageFromError(error, "初始化失败。");
   });
 });
 
 onUnmounted(() => {
+  window.removeEventListener(AUTH_INVALID_EVENT, handleAuthInvalid);
   if (documentProgressTimer !== undefined) window.clearInterval(documentProgressTimer);
   stopAgentStream();
 });
@@ -738,6 +968,119 @@ onUnmounted(() => {
     </section>
   </main>
 
+  <main v-else-if="needsOnboarding" class="profile-page">
+    <section class="profile-shell">
+      <header class="profile-hero">
+        <div>
+          <p class="eyebrow">FIRST RUN PROFILE</p>
+          <h1>先把你的面试准备画像定下来。</h1>
+          <p>系统会根据身份阶段、目标方向、准备重点和学习节奏，调整默认训练任务、Agent 规划和后续学习指标。</p>
+        </div>
+        <button class="ghost-button" @click="logout"><LogOut :size="15" />退出</button>
+      </header>
+
+      <form class="profile-form" @submit.prevent="submitUserProfile">
+        <section class="profile-section">
+          <div class="profile-section-title">
+            <BookOpenCheck :size="20" />
+            <div><h2>你现在处在哪个阶段？</h2><p>用于判断训练深度、项目追问密度和基础知识占比。</p></div>
+          </div>
+          <div class="profile-options single">
+            <button
+              v-for="item in candidateStageOptions"
+              :key="item.key"
+              type="button"
+              class="profile-option"
+              :class="{ active: profileForm.candidateStage === item.key }"
+              @click="profileForm.candidateStage = item.key"
+            >
+              <strong>{{ item.label }}</strong>
+              <small>{{ item.helper }}</small>
+            </button>
+          </div>
+        </section>
+
+        <section class="profile-section">
+          <div class="profile-section-title">
+            <Target :size="20" />
+            <div><h2>目标岗位方向</h2><p>可以多选，适合跨方向准备或 JD 尚未完全确定的用户。</p></div>
+          </div>
+          <div class="profile-options">
+            <button
+              v-for="item in targetRoleOptions"
+              :key="item.key"
+              type="button"
+              class="profile-option"
+              :class="{ active: profileForm.targetRoles.includes(item.key) }"
+              @click="toggleProfileValue(profileForm.targetRoles, item.key)"
+            >
+              <strong>{{ item.label }}</strong>
+              <small>{{ item.helper }}</small>
+            </button>
+          </div>
+        </section>
+
+        <section class="profile-section">
+          <div class="profile-section-title">
+            <SearchCheck :size="20" />
+            <div><h2>当前准备重点</h2><p>这些会成为后续 RAG 提问模板、模拟面试和复盘任务的优先级。</p></div>
+          </div>
+          <div class="profile-options">
+            <button
+              v-for="item in prepGoalOptions"
+              :key="item.key"
+              type="button"
+              class="profile-option"
+              :class="{ active: profileForm.prepGoals.includes(item.key) }"
+              @click="toggleProfileValue(profileForm.prepGoals, item.key)"
+            >
+              <strong>{{ item.label }}</strong>
+              <small>{{ item.helper }}</small>
+            </button>
+          </div>
+        </section>
+
+        <section class="profile-section">
+          <div class="profile-section-title">
+            <Gauge :size="20" />
+            <div><h2>学习节奏</h2><p>短期冲刺会提高默认训练强度，长期提升会更强调复习闭环。</p></div>
+          </div>
+          <div class="profile-options single">
+            <button
+              v-for="item in timelineOptions"
+              :key="item.key"
+              type="button"
+              class="profile-option"
+              :class="{ active: profileForm.timeline === item.key }"
+              @click="profileForm.timeline = item.key"
+            >
+              <strong>{{ item.label }}</strong>
+              <small>{{ item.helper }}</small>
+            </button>
+          </div>
+        </section>
+
+        <section class="profile-section">
+          <div class="profile-section-title">
+            <FileUp :size="20" />
+            <div><h2>目标 JD 或补充说明</h2><p>可选。后续做 JD 模拟面试时，Agent 会优先参考这里的描述。</p></div>
+          </div>
+          <textarea v-model="profileForm.targetJd" rows="4" placeholder="例如：3 年后端，Java/Spring Cloud，要求 Redis、MySQL 调优、分布式事务，有 RAG 项目加分。"></textarea>
+        </section>
+
+        <p v-if="profileForm.error" class="form-error">{{ profileForm.error }}</p>
+        <div class="profile-actions">
+          <span>这些内容会保存到你的学习画像中，之后可以继续更新。</span>
+          <button class="primary-button" :disabled="profileForm.loading">
+            <span>{{ profileForm.loading ? "保存中" : "保存画像并进入工作台" }}</span>
+            <LoaderCircle v-if="profileForm.loading" :size="17" class="spin" />
+            <ArrowRight v-else :size="17" />
+          </button>
+        </div>
+      </form>
+    </section>
+  </main>
+
   <div v-else class="app-frame">
     <aside class="sidebar">
       <div class="sidebar-head">
@@ -745,9 +1088,9 @@ onUnmounted(() => {
       </div>
       <p class="eyebrow sidebar-eyebrow">TRAINING FLOW</p>
       <nav class="primary-nav">
-        <a href="#workspace"><PanelLeft :size="19" /><span><strong>训练工作台</strong><small>RAG 问答与追问</small></span></a>
-        <a href="#sources"><Layers3 :size="19" /><span><strong>资料管理</strong><small>知识库与文档</small></span></a>
-        <a href="#agent"><Network :size="19" /><span><strong>Agent 提优</strong><small>事件流与复盘</small></span></a>
+        <a href="#workspace" :class="{ active: state.activePanel === 'workspace' }" @click.prevent="selectPanel('workspace')"><PanelLeft :size="19" /><span><strong>训练工作台</strong><small>RAG 问答与追问</small></span></a>
+        <a href="#sources" :class="{ active: state.activePanel === 'sources' }" @click.prevent="selectPanel('sources')"><Layers3 :size="19" /><span><strong>资料管理</strong><small>知识库与文档</small></span></a>
+        <a href="#agent" :class="{ active: state.activePanel === 'agent' }" @click.prevent="selectPanel('agent')"><Network :size="19" /><span><strong>Agent 提优</strong><small>事件流与复盘</small></span></a>
       </nav>
       <div class="sidebar-note">
         <span class="status-dot" :class="{ idle: !activeTask || activeTask.status !== 'running' }"></span>
@@ -764,8 +1107,8 @@ onUnmounted(() => {
     </aside>
 
     <main class="app-main">
-      <div class="coach-layout">
-        <aside id="sources" class="control-rail">
+      <div class="coach-layout" :class="`active-${state.activePanel}`">
+        <aside id="sources" class="control-rail" :class="{ active: state.activePanel === 'sources' }">
           <div class="control-scroll">
             <header class="rail-intro">
               <p class="eyebrow">SOURCE CONTROL</p>
@@ -777,19 +1120,27 @@ onUnmounted(() => {
               <div class="rail-heading"><h2>知识库</h2><span>{{ state.kbs.length }}</span></div>
               <select v-model.number="state.selectedKbId" class="select-field" @change="refreshDocs">
                 <option :value="0">个人文档</option>
-                <option v-for="kb in state.kbs" :key="kb.id" :value="kb.id">{{ kb.name }}</option>
+                <option v-for="kb in state.kbs" :key="kb.id" :value="kb.id">
+                  {{ kb.visibility === "shared" ? "[共享]" : "[私人]" }} {{ kb.name }}
+                </option>
               </select>
               <input v-model="state.newKbName" class="text-field" placeholder="新知识库名称" />
               <textarea v-model="state.newKbDescription" class="small-textarea" rows="3" placeholder="知识库说明"></textarea>
+              <select v-model="state.newKbVisibility" class="select-field">
+                <option value="private">私人知识库</option>
+                <option value="shared">共享知识库（管理员）</option>
+              </select>
               <button class="secondary-button full" :disabled="state.busy" @click="addKb"><Plus :size="15" />创建资料库</button>
             </section>
 
             <section class="source-card">
               <div class="rail-heading"><h2>文档</h2><span>{{ state.docs.length }}</span></div>
-              <label class="upload-box">
+              <label class="upload-box" :class="{ disabled: !selectedKbCanUpload }">
                 <UploadCloud :size="20" />
-                <span>{{ state.uploading ? "上传中" : "上传简历 / JD / 笔记" }}</span>
-                <input type="file" @change="onUpload" />
+                <span>
+                  {{ state.uploading ? "上传中" : selectedKbCanUpload ? `上传到${selectedKbScopeLabel}` : "仅管理员可上传共享库" }}
+                </span>
+                <input type="file" :disabled="!selectedKbCanUpload" @change="onUpload" />
               </label>
               <select v-model.number="state.selectedDocId" class="select-field">
                 <option :value="0">全部文档</option>
@@ -823,7 +1174,7 @@ onUnmounted(() => {
             </section>
 
             <section class="source-card">
-              <div class="rail-heading"><h2>训练模式</h2><span>{{ modes.length }}</span></div>
+              <div class="rail-heading"><h2>业务场景</h2><span>{{ modes.length }}</span></div>
               <button
                 v-for="mode in modes"
                 :key="mode.key"
@@ -833,12 +1184,13 @@ onUnmounted(() => {
               >
                 <strong>{{ mode.label }}</strong>
                 <small>{{ mode.helper }}</small>
+                <b>{{ mode.outputs.join(" · ") }}</b>
               </button>
             </section>
           </div>
         </aside>
 
-        <section id="workspace" class="learning-workspace">
+        <section id="workspace" class="learning-workspace" :class="{ active: state.activePanel === 'workspace' }">
           <header class="workspace-header">
             <div class="workspace-title">
               <p class="eyebrow">INTERVIEW IMPROVEMENT RAG</p>
@@ -860,7 +1212,7 @@ onUnmounted(() => {
             <div>
               <p class="eyebrow">MAIN AGENT ROUTE</p>
               <h3>{{ routeLabel }}</h3>
-              <p>{{ state.routeDecision?.reason || "输入后由主 Agent 判断：具体问题走 RAG，学习提升/系统规划设计走子 Agent。" }}</p>
+              <p>{{ state.routeDecision?.reason || "选择业务场景后会进入对应 Agent 流程；具体知识问题仍可使用仅 RAG 问答。" }}</p>
             </div>
             <span v-if="state.routeDecision">{{ Math.round(state.routeDecision.confidence * 100) }}%</span>
           </section>
@@ -870,9 +1222,9 @@ onUnmounted(() => {
             <section class="query-panel">
               <div class="panel-heading">
                 <div><p class="eyebrow">PROMPT</p><h3>面试训练输入</h3></div>
-                <span class="status-badge active">{{ state.selectedMode.label }}</span>
+                <span class="status-badge active">一级场景</span>
               </div>
-              <textarea v-model="state.query" rows="7" placeholder="输入你的面试主题、岗位要求、项目描述或薄弱点。"></textarea>
+              <textarea v-model="state.query" rows="7" placeholder="输入 JD、项目描述、知识点、历史回答或训练约束。"></textarea>
               <div class="control-grid">
                 <label><span>Top K</span><input v-model.number="state.topK" type="number" min="1" max="20" /></label>
                 <label><span>BM25 权重</span><input v-model.number="state.bm25Weight" type="number" min="0" max="1" step="0.1" /></label>
@@ -895,8 +1247,8 @@ onUnmounted(() => {
             <section v-if="!state.answer" class="workspace-empty">
               <div class="empty-constellation"><Target :size="28" /><span></span><i></i><i></i></div>
               <p class="eyebrow">MAIN AGENT READY</p>
-              <h2>输入具体问题，或描述你想提升的学习目标。</h2>
-              <p>具体问题会直接走 RAG 检索答案；学习规划、诊断、练习和复盘会进入子 Agent 协作流程。</p>
+              <h2>选择一个业务场景，然后补充材料或目标。</h2>
+              <p>场景会进入对应 Agent 流程；也可以用仅 RAG 问答快速查证某个知识点。</p>
             </section>
 
             <section v-else class="answer-layout">
@@ -923,7 +1275,7 @@ onUnmounted(() => {
           </div>
         </section>
 
-        <aside id="agent" class="activity-panel">
+        <aside id="agent" class="activity-panel" :class="{ active: state.activePanel === 'agent' }">
           <div class="activity-head">
             <div><p class="eyebrow">AGENT RUNTIME</p><h2>提优事件</h2></div>
             <span class="live-pill" :class="{ live: state.agentStreaming || activeTask?.status === 'running' }"><i></i>{{ state.agentStreaming ? "streaming" : activeTask?.status || "idle" }}</span>

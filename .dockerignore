@@ -33,4 +33,6 @@ tests
 evaluation/tests
 evaluation
 scripts
-frontend
+frontend/node_modules
+frontend/dist
+frontend/*.tsbuildinfo

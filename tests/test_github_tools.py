@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-import app.agent_runtime.tools as tools
-from app.agent_runtime.tools import call_tool, list_tools
+import deerflow.tools as tools
+from deerflow.tools import call_tool, list_tools
 
 
 class FakeGitHubResponse:
@@ -94,8 +94,8 @@ def test_tool_agent_can_read_github_readme(monkeypatch) -> None:
     assert result["grounding"]["repo"] == "langchain-ai/langgraph"
 
 
-def test_verifier_agent_cannot_call_github_tools() -> None:
-    result = call_tool("github.read_readme", {"repo": "langchain-ai/langgraph"}, agent="verifier_agent")
+def test_research_agent_cannot_call_github_tools() -> None:
+    result = call_tool("github.read_readme", {"repo": "langchain-ai/langgraph"}, agent="research_agent")
 
     assert result["ok"] is False
     assert result["error"]["type"] == "tool_permission_denied"

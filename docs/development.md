@@ -22,8 +22,13 @@ npm run build
 ```
 
 ```powershell
-docker compose -f docker-compose.yml config
-docker compose -f docker-compose.prod.yml config
+$env:PYTHONPATH = "backend;backend/packages/harness"
+uv run --frozen celery -A app.core.celery:celery_app worker --loglevel=INFO --queues=document_index,agent_runtime
+```
+
+```powershell
+docker compose -f docker/docker-compose.yml config
+docker compose -f docker/docker-compose.prod.yml config
 ```
 
 ## Local Artifacts

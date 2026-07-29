@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-learning-rag.local/contracts/skill-review.schema.json",
+  "title": "Skill Review",
+  "type": "object",
+  "required": ["skill_name", "status", "reviewed_at"],
+  "properties": {
+    "skill_name": { "type": "string", "minLength": 1 },
+    "version": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["approved", "needs_changes", "blocked", "deprecated"]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "message"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["info", "warning", "error"]
+          },
+          "message": { "type": "string" },
+          "path": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "default": []
+    },
+    "reviewed_by": { "type": "string" },
+    "reviewed_at": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": false
+}

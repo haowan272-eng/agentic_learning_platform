@@ -1,0 +1,174 @@
+name: interview-improvement-rag
+
+x-backend-env: &backend-env
+  APP_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_JSON: ${LOG_JSON:-true}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-interview_user}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-interview_improvement_rag}
+  REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+  CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/1
+  CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/2
+  QDRANT_URL: http://qdrant:6333
+  QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+  QDRANT_PREFER_GRPC: ${QDRANT_PREFER_GRPC:-false}
+  QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME:-interview_improvement_chunks}
+  QDRANT_DIM: ${QDRANT_DIM:-1024}
+  HOST: 0.0.0.0
+  PORT: 8001
+  SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY}
+  REFRESH_SECRET_KEY: ${REFRESH_SECRET_KEY:?set REFRESH_SECRET_KEY}
+  CORS_ORIGINS: ${CORS_ORIGINS:?set CORS_ORIGINS}
+  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}
+  DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+  DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+  OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
+  AGENT_PLANNER_MODEL_CHAIN: ${AGENT_PLANNER_MODEL_CHAIN:-deepseek,openai,anthropic}
+  AGENT_ARCHITECT_MODEL_CHAIN: ${AGENT_ARCHITECT_MODEL_CHAIN:-deepseek,openai,anthropic}
+  AGENT_JUDGE_MODEL_CHAIN: ${AGENT_JUDGE_MODEL_CHAIN:-deepseek,openai,anthropic}
+  AGENT_TASK_DEFAULT_DEADLINE_SECONDS: ${AGENT_TASK_DEFAULT_DEADLINE_SECONDS:-900}
+  AGENT_TASK_DEFAULT_MAX_STEPS: ${AGENT_TASK_DEFAULT_MAX_STEPS:-8}
+  AGENT_TASK_DEFAULT_MAX_TOOL_CALLS: ${AGENT_TASK_DEFAULT_MAX_TOOL_CALLS:-12}
+  AGENT_TASK_DEFAULT_MAX_TOKENS: ${AGENT_TASK_DEFAULT_MAX_TOKENS:-24000}
+  AGENT_TASK_DEFAULT_MAX_COST_USD: ${AGENT_TASK_DEFAULT_MAX_COST_USD:-2.0}
+  AGENT_SANDBOX_URL: ${AGENT_SANDBOX_URL:-}
+  AGENT_SANDBOX_TOKEN: ${AGENT_SANDBOX_TOKEN:-}
+  LANGGRAPH_CHECKPOINT_SETUP: ${LANGGRAPH_CHECKPOINT_SETUP:-false}
+  MODEL_ROOT: /app/models
+  UPLOAD_DIR: /app/uploads
+
+services:
+  migrate:
+    build:
+      context: ..
+      dockerfile: docker/backend.Dockerfile
+    image: interview-improvement-rag-backend:prod
+    command: uv run --frozen --no-dev alembic upgrade head
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/backend.Dockerfile
+    image: interview-improvement-rag-backend:prod
+    container_name: interview-improvement-rag-backend
+    environment:
+      <<: *backend-env
+    ports:
+      - "${BACKEND_PORT:-8001}:8001"
+    volumes:
+      - uploads_data:/app/uploads
+      - ${MODEL_ROOT:?set MODEL_ROOT}:/app/models:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+  worker:
+    image: interview-improvement-rag-backend:prod
+    command: uv run --frozen --no-dev celery -A app.core.celery:celery_app worker --loglevel=INFO --queues=document_index,agent_runtime --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
+    environment:
+      <<: *backend-env
+    volumes:
+      - uploads_data:/app/uploads
+      - ${MODEL_ROOT:?set MODEL_ROOT}:/app/models:ro
+      - model_cache:/root/.cache/huggingface
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    restart: always
+    stop_grace_period: 30s
+
+  beat:
+    image: interview-improvement-rag-backend:prod
+    command: uv run --frozen --no-dev celery -A app.core.celery:celery_app beat --loglevel=INFO
+    environment:
+      <<: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: always
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/frontend.Dockerfile
+      args:
+        VITE_API_BASE: ${FRONTEND_API_BASE:-}
+    image: interview-improvement-rag-frontend:prod
+    container_name: interview-improvement-rag-frontend
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: always
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: interview-improvement-rag-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-interview_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-interview_improvement_rag}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    container_name: interview-improvement-rag-redis
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory 256mb --maxmemory-policy noeviction --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?set REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.1
+    container_name: interview-improvement-rag-qdrant
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: always
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  uploads_data:
+  model_cache:

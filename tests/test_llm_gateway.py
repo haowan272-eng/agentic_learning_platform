@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from app.agent_runtime.llm_gateway import (
+from deerflow.llm_gateway import (
     LLMConfigurationError,
     LLMGateway,
     LLMGatewayError,
@@ -111,7 +111,7 @@ class TestCircuitBreaker:
 
     def test_failure_below_threshold_still_allows(self, monkeypatch):
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.AGENT_LLM_PROVIDER_FAILURE_THRESHOLD", 3,
+            "deerflow.llm_gateway.AGENT_LLM_PROVIDER_FAILURE_THRESHOLD", 3,
         )
         gw = _make_gateway()
         gw._report_failure("deepseek")  # 1
@@ -120,10 +120,10 @@ class TestCircuitBreaker:
 
     def test_failure_at_threshold_opens_circuit(self, monkeypatch):
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.AGENT_LLM_PROVIDER_FAILURE_THRESHOLD", 2,
+            "deerflow.llm_gateway.AGENT_LLM_PROVIDER_FAILURE_THRESHOLD", 2,
         )
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.AGENT_LLM_PROVIDER_COOLDOWN_SECONDS", 30,
+            "deerflow.llm_gateway.AGENT_LLM_PROVIDER_COOLDOWN_SECONDS", 30,
         )
         gw = _make_gateway()
         gw._report_failure("deepseek")  # 1
@@ -132,10 +132,10 @@ class TestCircuitBreaker:
 
     def test_circuit_recloses_after_cooldown(self, monkeypatch):
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.AGENT_LLM_PROVIDER_FAILURE_THRESHOLD", 2,
+            "deerflow.llm_gateway.AGENT_LLM_PROVIDER_FAILURE_THRESHOLD", 2,
         )
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.AGENT_LLM_PROVIDER_COOLDOWN_SECONDS", 5,
+            "deerflow.llm_gateway.AGENT_LLM_PROVIDER_COOLDOWN_SECONDS", 5,
         )
         gw = _make_gateway()
         # Use a controlled clock so the cooldown window is precise.
@@ -157,10 +157,10 @@ class TestCircuitBreaker:
 
     def test_half_open_single_failure_does_not_reopen_immediately(self, monkeypatch):
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.AGENT_LLM_PROVIDER_FAILURE_THRESHOLD", 2,
+            "deerflow.llm_gateway.AGENT_LLM_PROVIDER_FAILURE_THRESHOLD", 2,
         )
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.AGENT_LLM_PROVIDER_COOLDOWN_SECONDS", 5,
+            "deerflow.llm_gateway.AGENT_LLM_PROVIDER_COOLDOWN_SECONDS", 5,
         )
         gw = _make_gateway()
         fake_now = 1000.0
@@ -179,10 +179,10 @@ class TestCircuitBreaker:
 
     def test_independent_providers(self, monkeypatch):
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.AGENT_LLM_PROVIDER_FAILURE_THRESHOLD", 2,
+            "deerflow.llm_gateway.AGENT_LLM_PROVIDER_FAILURE_THRESHOLD", 2,
         )
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.AGENT_LLM_PROVIDER_COOLDOWN_SECONDS", 30,
+            "deerflow.llm_gateway.AGENT_LLM_PROVIDER_COOLDOWN_SECONDS", 30,
         )
         gw = _make_gateway()
         gw._report_failure("deepseek")
@@ -197,13 +197,13 @@ class TestCircuitBreaker:
 class TestCredentials:
     def test_missing_key_returns_false(self, monkeypatch):
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.DEEPSEEK_API_KEY", "",
+            "deerflow.llm_gateway.DEEPSEEK_API_KEY", "",
         )
         assert LLMGateway._credentials_present("deepseek") is False
 
     def test_present_key_returns_true(self, monkeypatch):
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.DEEPSEEK_API_KEY", "sk-123",
+            "deerflow.llm_gateway.DEEPSEEK_API_KEY", "sk-123",
         )
         assert LLMGateway._credentials_present("deepseek") is True
 
@@ -214,19 +214,19 @@ class TestCredentials:
 class TestChainOrdering:
     def test_chain_returns_configured_providers(self, monkeypatch):
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.AGENT_PLANNER_MODEL_CHAIN", "deepseek,openai",
+            "deerflow.llm_gateway.AGENT_PLANNER_MODEL_CHAIN", "deepseek,openai",
         )
         assert LLMGateway._chain("planner") == ["deepseek", "openai"]
 
     def test_chain_ignores_whitespace(self, monkeypatch):
         monkeypatch.setattr(
-            "app.agent_runtime.llm_gateway.AGENT_ARCHITECT_MODEL_CHAIN",
+            "deerflow.llm_gateway.AGENT_ARCHITECT_MODEL_CHAIN",
             "  deepseek , anthropic  ",
         )
         assert LLMGateway._chain("architect") == ["deepseek", "anthropic"]
 
     def test_judge_uses_zero_temperature(self):
-        from app.agent_runtime.llm_gateway import ROLE_POLICIES
+        from deerflow.llm_gateway import ROLE_POLICIES
         assert ROLE_POLICIES["judge"].temperature == 0.0
 
 

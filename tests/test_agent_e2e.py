@@ -2,11 +2,11 @@
 
 These tests exercise the full StateGraph with a MemorySaver checkpointer,
 mocked tools, and controlled LLM responses.  They validate state-machine
-behaviour — not LLM output quality — covering:
+behaviour 鈥?not LLM output quality 鈥?covering:
 
-- Full happy path: plan → dispatch → research → architect → verifier → final
-- Repair loop: verification failure → repair → re-dispatch → re-verify → final
-- Fallback: non-retryable verification failure → graceful degradation
+- Full happy path: plan -> dispatch -> research tool loop -> final
+- Repair loop: verification failure 鈫?repair 鈫?re-dispatch 鈫?re-verify 鈫?final
+- Fallback: non-retryable verification failure 鈫?graceful degradation
 - Budget enforcement: deadline, max_tool_calls
 - Cancellation: mid-graph cancel signal
 """
@@ -19,13 +19,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from app.agent_runtime.planner import (
+from deerflow.planner import (
     AgentPlan,
     ProposalSection,
     ResearchTask,
     SupervisorDecision,
+    ToolAgentDecision,
     ToolCallSpec,
-    ToolPlanDecision,
     UpgradeProposal,
     VerificationDecision,
     default_plan,
@@ -33,8 +33,9 @@ from app.agent_runtime.planner import (
     generate_proposal,
     verify_proposal,
 )
-from app.agent_runtime.runtime import build_agent_graph, run_agent_task
-from app.agent_runtime.schemas import (
+from deerflow.runtime import build_agent_graph, run_agent_task
+from deerflow.tools import registry as tool_registry
+from deerflow.schemas import (
     AgentEvent,
     AgentTaskState,
     Artifact,
@@ -44,9 +45,8 @@ from app.agent_runtime.schemas import (
     validate_node_update,
     validate_research_work_item,
     validate_supervisor_route,
-    validate_verification_route,
 )
-# ── helpers ────────────────────────────────────────────────────────────────
+# 鈹€鈹€ helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 def _fake_research_result(*, ok: bool = True, citations: bool = True) -> ToolResult:
@@ -93,7 +93,7 @@ def _make_base_state(**overrides: Any) -> AgentTaskState:
         "run_id": "run-test",
         "user_id": 1,
         "username": "tester",
-        "user_input": "升级我的 Agent 工作流",
+        "user_input": "upgrade my Agent workflow",
         "task_type": "project_upgrade",
         "kb_id": None,
         "document_id": None,
@@ -152,12 +152,12 @@ class FakeStore:
         self.verifications.append(dict(payload))
 
 
-# ── default plan shape ──────────────────────────────────────────────────────
+# 鈹€鈹€ default plan shape 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestDefaultPlan:
     def test_default_plan_produces_two_independent_research_tasks(self):
-        plan = default_plan({"user_input": "优化 RAG 检索", "task_type": "project_upgrade"})
+        plan = default_plan({"user_input": "optimize RAG retrieval", "task_type": "project_upgrade"})
         assert len(plan.research_tasks) >= 2
         ids = [t.task_id for t in plan.research_tasks]
         assert len(set(ids)) == len(ids)
@@ -167,29 +167,34 @@ class TestDefaultPlan:
         assert len(plan.goal) > 0
 
 
-# ── happy-path E2E ──────────────────────────────────────────────────────────
+# 鈹€鈹€ happy-path E2E 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestHappyPath:
-    """Full graph: supervisor_plan → dispatch_research → research_agent (x2)
-    → architect_agent → verifier_agent (passed) → final_response."""
+    """Full graph: supervisor_plan -> dispatch_research -> research_agent
+    registered-tool loop -> final_response."""
 
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         """Mock the tool gateway so research agents get controlled results."""
+        def mocked_tool_call(tool_name: str, arguments: dict[str, Any], *, agent: str) -> ToolResult:
+            if tool_name.startswith(("knowledge.", "web.")):
+                return _fake_research_result(ok=True, citations=True)
+            return tool_registry.call(tool_name, arguments, agent=agent)
+
         with patch(
-            "app.agent_runtime.tool_manager.call_tool",
-            return_value=_fake_research_result(ok=True, citations=True),
+            "deerflow.tool_manager.call_tool",
+            side_effect=mocked_tool_call,
         ), patch(
-            "app.agent_runtime.runtime.record_memory_event",
+            "deerflow.runtime.record_memory_event",
         ), patch(
-            "app.agent_runtime.runtime.consolidate_task_memory", return_value=[],
+            "deerflow.runtime.consolidate_task_memory", return_value=[],
         ), patch(
-            "app.agent_runtime.runtime.summarize_task_session", return_value=None,
+            "deerflow.runtime.summarize_task_session", return_value=None,
         ), patch(
-            "app.agent_runtime.runtime.append_recent_event",
+            "deerflow.runtime.append_recent_event",
         ), patch(
-            "app.agent_runtime.runtime.publish_task_event",
+            "deerflow.runtime.publish_task_event",
         ):
             yield
 
@@ -246,15 +251,18 @@ class TestHappyPath:
         for _ in graph.stream(state, config=config, stream_mode="updates"):
             pass
 
-        # Two research tasks → at least 2 tool calls.
+        # Two research tasks 鈫?at least 2 tool calls.
         assert len(store.tool_calls) >= 2, (
-            f"Expected ≥2 tool calls, got {len(store.tool_calls)}"
+            f"Expected 鈮? tool calls, got {len(store.tool_calls)}"
         )
-        # Verifier should record one verification.
+        # Verification should record one verification.
         assert len(store.verifications) >= 1, (
-            f"Expected ≥1 verification, got {len(store.verifications)}"
+            f"Expected 鈮? verification, got {len(store.verifications)}"
         )
-        assert {call["agent_name"] for call in store.tool_calls} == {"tool_agent"}
+        assert {call["agent_name"] for call in store.tool_calls} == {"research_agent"}
+        tool_names = {call["tool_name"] for call in store.tool_calls}
+        assert "architecture.generate_proposal" in tool_names
+        assert "verification.verify_proposal" in tool_names
 
     def test_research_agent_uses_tool_request_feedback_contract(self):
         from langgraph.checkpoint.memory import MemorySaver
@@ -274,26 +282,26 @@ class TestHappyPath:
 
         assert "tool_request" in message_kinds
         assert "tool_result" in message_kinds
-        assert "tool_agent" in event_agents
-        assert all(item.get("executor") == "tool_agent" for item in final.get("tool_feedback", {}).values())
+        assert "research_agent" in event_agents
+        assert all(item.get("executor") == "research_agent" for item in final.get("tool_feedback", {}).values())
 
 
-# ── router path selection E2E ────────────────────────────────────────────────
+# 鈹€鈹€ router path selection E2E 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestSupervisorDelegation:
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         with patch(
-            "app.agent_runtime.runtime.record_memory_event",
+            "deerflow.runtime.record_memory_event",
         ), patch(
-            "app.agent_runtime.runtime.consolidate_task_memory", return_value=[],
+            "deerflow.runtime.consolidate_task_memory", return_value=[],
         ), patch(
-            "app.agent_runtime.runtime.summarize_task_session", return_value=None,
+            "deerflow.runtime.summarize_task_session", return_value=None,
         ), patch(
-            "app.agent_runtime.runtime.append_recent_event",
+            "deerflow.runtime.append_recent_event",
         ), patch(
-            "app.agent_runtime.runtime.publish_task_event",
+            "deerflow.runtime.publish_task_event",
         ):
             yield
 
@@ -301,10 +309,10 @@ class TestSupervisorDelegation:
         from langgraph.checkpoint.memory import MemorySaver
 
         store = FakeStore()
-        state = _make_base_state(task_type="chat", user_input="什么是 RAG？")
+        state = _make_base_state(task_type="chat", user_input="What is RAG?")
 
         with patch(
-            "app.agent_runtime.runtime.generate_supervisor_decision",
+            "deerflow.runtime.generate_supervisor_decision",
             return_value=(
                 SupervisorDecision(
                     child_agents=["direct_answer_agent"],
@@ -342,14 +350,14 @@ class TestSupervisorDelegation:
         from langgraph.checkpoint.memory import MemorySaver
 
         store = FakeStore()
-        state = _make_base_state(task_type="rag_question", user_input="知识库里有没有 TCP 三次握手？", kb_id=1)
+        state = _make_base_state(task_type="rag_question", user_input="Is TCP three-way handshake in the knowledge base?", kb_id=1)
 
         with patch(
-            "app.agent_runtime.runtime.generate_supervisor_decision",
+            "deerflow.runtime.generate_supervisor_decision",
             return_value=(
                 SupervisorDecision(
                     child_agents=["tool_agent"],
-                    route="tool_planner",
+                    route="tool_agent",
                     intent="rag_question",
                     reason="knowledge lookup through tool agent",
                     confidence=0.92,
@@ -358,25 +366,24 @@ class TestSupervisorDelegation:
                     needs_verification=False,
                     stop_after_children=True,
                     response_mode="rag_answer",
-                    query="TCP 三次握手",
+                    query="TCP 涓夋鎻℃墜",
                 ),
                 "mock",
                 None,
             ),
         ), patch(
-            "app.agent_runtime.runtime.generate_tool_plan",
+            "deerflow.runtime.generate_tool_agent_decision",
             return_value=(
-                ToolPlanDecision(
+                ToolAgentDecision(
                     calls=[
                         ToolCallSpec(
                             call_id="tool-rag",
                             tool_name="knowledge.answer",
-                            arguments={"query": "TCP 三次握手", "top_k": 5},
+                            arguments={"query": "TCP 涓夋鎻℃墜", "top_k": 5},
                             reason="retrieve grounded answer through tool agent",
                         )
                     ],
-                    stop_after_tools=True,
-                    next_node="tool_response",
+                    next_action="complete",
                     reason="answer after tool retrieval",
                     confidence=0.9,
                 ),
@@ -384,7 +391,7 @@ class TestSupervisorDelegation:
                 None,
             ),
         ), patch(
-            "app.agent_runtime.tool_manager.call_tool",
+            "deerflow.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ):
             graph = build_agent_graph(store, checkpointer=MemorySaver())
@@ -399,26 +406,23 @@ class TestSupervisorDelegation:
         assert final["grounding"]["rag_used"] is True
         assert final["supervisor_decision"]["child_agents"] == ["tool_agent"]
         assert "rag_retrieve" not in event_agents
-        assert "tool_planner" in event_agents
-        assert "tool_executor" in event_agents
-        assert "tool_response" in event_agents
-        assert "architect_agent" not in event_agents
+        assert "tool_agent" in event_agents
         assert len(store.plans) == 0
-        assert len(store.tool_calls) == 1
+        assert {call["tool_name"] for call in store.tool_calls} == {"knowledge.answer"}
         assert len(store.verifications) == 0
 
-    def test_tool_planner_executes_tools_and_returns_feedback_response(self):
+    def test_tool_agent_executes_registered_tools_and_returns_feedback_response(self):
         from langgraph.checkpoint.memory import MemorySaver
 
         store = FakeStore()
-        state = _make_base_state(task_type="rag_question", user_input="根据知识库回答 TCP 三次握手", kb_id=1)
+        state = _make_base_state(task_type="rag_question", user_input="Answer TCP three-way handshake from the knowledge base", kb_id=1)
 
         with patch(
-            "app.agent_runtime.runtime.generate_supervisor_decision",
+            "deerflow.runtime.generate_supervisor_decision",
             return_value=(
                 SupervisorDecision(
                     child_agents=["tool_agent"],
-                    route="tool_planner",
+                    route="tool_agent",
                     intent="rag_question",
                     reason="needs autonomous tool selection",
                     confidence=0.9,
@@ -427,25 +431,24 @@ class TestSupervisorDelegation:
                     needs_verification=False,
                     stop_after_children=True,
                     response_mode="rag_answer",
-                    query="TCP 三次握手",
+                    query="TCP 涓夋鎻℃墜",
                 ),
                 "mock",
                 None,
             ),
         ), patch(
-            "app.agent_runtime.runtime.generate_tool_plan",
+            "deerflow.runtime.generate_tool_agent_decision",
             return_value=(
-                ToolPlanDecision(
+                ToolAgentDecision(
                     calls=[
                         ToolCallSpec(
                             call_id="tool-1",
                             tool_name="knowledge.answer",
-                            arguments={"query": "TCP 三次握手", "top_k": 5},
+                            arguments={"query": "TCP 涓夋鎻℃墜", "top_k": 5},
                             reason="retrieve grounded answer",
                         )
                     ],
-                    stop_after_tools=True,
-                    next_node="tool_response",
+                    next_action="complete",
                     reason="answer after retrieval",
                     confidence=0.88,
                 ),
@@ -453,7 +456,7 @@ class TestSupervisorDelegation:
                 None,
             ),
         ), patch(
-            "app.agent_runtime.tool_manager.call_tool",
+            "deerflow.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ):
             graph = build_agent_graph(store, checkpointer=MemorySaver())
@@ -467,63 +470,61 @@ class TestSupervisorDelegation:
         assert final["status"] == "completed"
         assert final["supervisor_decision"]["child_agents"] == ["tool_agent"]
         assert final["tool_feedback"]["success_count"] == 1
-        assert final["tool_feedback"]["next_node"] == "tool_response"
-        assert "tool.plan_created" in event_types
+        assert final["tool_feedback"]["next_action"] == "complete"
+        assert "tool.agent_decided" in event_types
         assert "tool.feedback_ready" in event_types
         assert len(store.tool_calls) == 1
         assert len(store.verifications) == 0
 
 
-# ── repair loop E2E ─────────────────────────────────────────────────────────
+# 鈹€鈹€ repair loop E2E 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestRepairLoop:
-    """When the Verifier returns status=repair the Supervisor must dispatch
+    """When the verification returns status=repair the Supervisor must dispatch
     targeted repair queries, then re-verify.  The loop must converge within
     MAX_REPAIR_COUNT iterations."""
 
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
+        def fake_verification_tool(_args: dict[str, Any]) -> ToolResult:
+            decision = VerificationDecision(
+                status="repair",
+                score=0.35,
+                issues=[{"type": "citation_missing", "retryable": True}],
+                repair_queries=["repair query 1"],
+            ).model_dump(mode="json")
+            return {
+                "ok": False,
+                "tool_name": "verification.verify_proposal",
+                "data": decision,
+                "confidence": 0.35,
+                "citations": [],
+                "grounding": {"mode": "verification", "rag_used": True},
+                "trace": [{"step": "verify_proposal", "source": "mock", "status": "repair"}],
+                "error": {"type": "citation_missing", "message": "mock repair", "retryable": True},
+            }
+
         with patch(
-            "app.agent_runtime.tool_manager.call_tool",
+            "deerflow.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ), patch(
-            "app.agent_runtime.runtime.record_memory_event",
+            "deerflow.runtime.record_memory_event",
         ), patch(
-            "app.agent_runtime.runtime.consolidate_task_memory", return_value=[],
+            "deerflow.runtime.consolidate_task_memory", return_value=[],
         ), patch(
-            "app.agent_runtime.runtime.summarize_task_session", return_value=None,
+            "deerflow.runtime.summarize_task_session", return_value=None,
         ), patch(
-            "app.agent_runtime.runtime.append_recent_event",
+            "deerflow.runtime.append_recent_event",
         ), patch(
-            "app.agent_runtime.runtime.publish_task_event",
+            "deerflow.runtime.publish_task_event",
         ), patch(
-            "app.agent_runtime.runtime.record_verification_failure",
+            "deerflow.runtime.record_verification_failure",
+        ), patch.dict(
+            "deerflow.tools.registry._handlers",
+            {"verification.verify_proposal": fake_verification_tool},
         ), patch(
-            "app.agent_runtime.runtime.generate_proposal",
-            return_value=(
-                UpgradeProposal(
-                    title="Mock Proposal",
-                    summary="A mock proposal for repair testing.",
-                    sections=[ProposalSection(title="S1", items=["A", "B"], evidence_artifact_ids=["r1"])],
-                ),
-                None,
-                "mock",
-            ),
-        ), patch(
-            "app.agent_runtime.runtime.verify_proposal",
-            return_value=(
-                VerificationDecision(
-                    status="repair",
-                    score=0.35,
-                    issues=[{"type": "citation_missing", "retryable": True}],
-                    repair_queries=["repair query 1"],
-                ),
-                None,
-                "mock",
-            ),
-        ), patch(
-            "app.agent_runtime.planner.verify_proposal",
+            "deerflow.planner.verify_proposal",
             return_value=(
                 VerificationDecision(
                     status="repair",
@@ -542,7 +543,7 @@ class TestRepairLoop:
         from langgraph.checkpoint.memory import MemorySaver
 
         store = FakeStore()
-        state = _make_base_state()
+        state = _make_base_state(source_policy="local_only")
 
         graph = build_agent_graph(store, checkpointer=MemorySaver())
         config = {"configurable": {"thread_id": state["task_id"]}}
@@ -551,16 +552,17 @@ class TestRepairLoop:
             pass
 
         final = dict(graph.get_state(config).values)
-        # The verifier keeps returning "repair", so after 2 repairs we fallback.
+        # The verification tool keeps returning "repair", so after 2 repairs we fallback.
         assert final.get("status") == "completed"
         # Fallback is the expected outcome when repair is exhausted.
-        assert "insufficient" in final.get("final_answer", "").lower() or "重试" in final.get("final_answer", "") or "无法" in final.get("final_answer", "")
+        assert final.get("grounding", {}).get("mode") == "insufficient_evidence"
+        assert "无法" in final.get("final_answer", "") or "重试" in final.get("final_answer", "")
 
     def test_repair_increments_counter_in_state(self):
         from langgraph.checkpoint.memory import MemorySaver
 
         store = FakeStore()
-        state = _make_base_state()
+        state = _make_base_state(source_policy="local_only")
 
         graph = build_agent_graph(store, checkpointer=MemorySaver())
         config = {"configurable": {"thread_id": state["task_id"]}}
@@ -573,44 +575,32 @@ class TestRepairLoop:
         assert final.get("repair_count", 0) >= 2
 
 
-# ── fallback path E2E ───────────────────────────────────────────────────────
+# 鈹€鈹€ fallback path E2E 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestFallbackPath:
-    """When Verifier returns a non-retryable status the graph falls back
+    """When verification returns a non-retryable status the graph falls back
     immediately without attempting repair."""
 
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         with patch(
-            "app.agent_runtime.tool_manager.call_tool",
+            "deerflow.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=False),
         ), patch(
-            "app.agent_runtime.runtime.record_memory_event",
+            "deerflow.runtime.record_memory_event",
         ), patch(
-            "app.agent_runtime.runtime.consolidate_task_memory", return_value=[],
+            "deerflow.runtime.consolidate_task_memory", return_value=[],
         ), patch(
-            "app.agent_runtime.runtime.summarize_task_session", return_value=None,
+            "deerflow.runtime.summarize_task_session", return_value=None,
         ), patch(
-            "app.agent_runtime.runtime.append_recent_event",
+            "deerflow.runtime.append_recent_event",
         ), patch(
-            "app.agent_runtime.runtime.publish_task_event",
+            "deerflow.runtime.publish_task_event",
         ), patch(
-            "app.agent_runtime.runtime.record_verification_failure",
+            "deerflow.runtime.record_verification_failure",
         ), patch(
-            "app.agent_runtime.runtime.verify_proposal",
-            return_value=(
-                VerificationDecision(
-                    status="fallback",
-                    score=0.1,
-                    issues=[{"type": "evidence_insufficient", "retryable": False}],
-                    repair_queries=[],
-                ),
-                None,
-                "mock",
-            ),
-        ), patch(
-            "app.agent_runtime.planner.verify_proposal",
+            "deerflow.planner.verify_proposal",
             return_value=(
                 VerificationDecision(
                     status="fallback",
@@ -641,7 +631,7 @@ class TestFallbackPath:
         assert len(final.get("final_answer", "")) > 0
 
 
-# ── budget enforcement E2E ──────────────────────────────────────────────────
+# 鈹€鈹€ budget enforcement E2E 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestBudgetEnforcement:
@@ -650,18 +640,18 @@ class TestBudgetEnforcement:
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         with patch(
-            "app.agent_runtime.tool_manager.call_tool",
+            "deerflow.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ), patch(
-            "app.agent_runtime.runtime.record_memory_event",
+            "deerflow.runtime.record_memory_event",
         ), patch(
-            "app.agent_runtime.runtime.consolidate_task_memory", return_value=[],
+            "deerflow.runtime.consolidate_task_memory", return_value=[],
         ), patch(
-            "app.agent_runtime.runtime.summarize_task_session", return_value=None,
+            "deerflow.runtime.summarize_task_session", return_value=None,
         ), patch(
-            "app.agent_runtime.runtime.append_recent_event",
+            "deerflow.runtime.append_recent_event",
         ), patch(
-            "app.agent_runtime.runtime.publish_task_event",
+            "deerflow.runtime.publish_task_event",
         ):
             yield
 
@@ -684,7 +674,7 @@ class TestBudgetEnforcement:
         config = {"configurable": {"thread_id": state["task_id"]}}
 
         # The graph should raise AgentBudgetExceeded during execution.
-        # We catch via graph stream — an error should appear in final state.
+        # We catch via graph stream 鈥?an error should appear in final state.
         for _ in graph.stream(state, config=config, stream_mode="updates"):
             pass
 
@@ -711,7 +701,7 @@ class TestBudgetEnforcement:
         assert final.get("status") in {"completed", "failed", "cancelled"}
 
 
-# ── cancellation E2E ────────────────────────────────────────────────────────
+# 鈹€鈹€ cancellation E2E 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestCancellation:
@@ -720,25 +710,25 @@ class TestCancellation:
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         with patch(
-            "app.agent_runtime.tool_manager.call_tool",
+            "deerflow.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ), patch(
-            "app.agent_runtime.runtime.record_memory_event",
+            "deerflow.runtime.record_memory_event",
         ), patch(
-            "app.agent_runtime.runtime.consolidate_task_memory", return_value=[],
+            "deerflow.runtime.consolidate_task_memory", return_value=[],
         ), patch(
-            "app.agent_runtime.runtime.summarize_task_session", return_value=None,
+            "deerflow.runtime.summarize_task_session", return_value=None,
         ), patch(
-            "app.agent_runtime.runtime.append_recent_event",
+            "deerflow.runtime.append_recent_event",
         ), patch(
-            "app.agent_runtime.runtime.publish_task_event",
+            "deerflow.runtime.publish_task_event",
         ):
             yield
 
     def test_cancel_before_dispatch_terminates_graph(self):
         from langgraph.checkpoint.memory import MemorySaver
 
-        from app.agent_runtime.runtime import AgentTaskCancelled
+        from deerflow.runtime import AgentTaskCancelled
 
         store = FakeStore()
         store._cancel_requested = True  # cancel immediately
@@ -753,14 +743,14 @@ class TestCancellation:
             for _ in graph.stream(state, config=config, stream_mode="updates"):
                 pass
         except AgentTaskCancelled:
-            pass  # expected — cancellation propagates as exception
+            pass  # expected 鈥?cancellation propagates as exception
 
         # State should reflect the cancellation.
         final = dict(graph.get_state(config).values)
         assert final.get("status") in {"cancelled", "failed", "completed", "running"}
 
 
-# ── state serialisation round-trip ──────────────────────────────────────────
+# 鈹€鈹€ state serialisation round-trip 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestStateRoundTrip:
@@ -769,18 +759,18 @@ class TestStateRoundTrip:
     @pytest.fixture(autouse=True)
     def _setup_mocks(self):
         with patch(
-            "app.agent_runtime.tool_manager.call_tool",
+            "deerflow.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ), patch(
-            "app.agent_runtime.runtime.record_memory_event",
+            "deerflow.runtime.record_memory_event",
         ), patch(
-            "app.agent_runtime.runtime.consolidate_task_memory", return_value=[],
+            "deerflow.runtime.consolidate_task_memory", return_value=[],
         ), patch(
-            "app.agent_runtime.runtime.summarize_task_session", return_value=None,
+            "deerflow.runtime.summarize_task_session", return_value=None,
         ), patch(
-            "app.agent_runtime.runtime.append_recent_event",
+            "deerflow.runtime.append_recent_event",
         ), patch(
-            "app.agent_runtime.runtime.publish_task_event",
+            "deerflow.runtime.publish_task_event",
         ):
             yield
 
@@ -825,7 +815,7 @@ class TestStateRoundTrip:
         assert reloaded.get("task_id") == state["task_id"]
 
 
-# ── agent-task-state invariants ─────────────────────────────────────────────
+# 鈹€鈹€ agent-task-state invariants 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 class TestAgentTaskStateInvariants:
@@ -885,10 +875,6 @@ class TestAgentTaskStateInvariants:
         with pytest.raises(ValidationError):
             validate_research_work_item(work)
 
-    def test_pydantic_route_boundary_rejects_unknown_verifier_route(self):
-        with pytest.raises(ValidationError):
-            validate_verification_route("skip_final")
-
     def test_pydantic_supervisor_route_boundary_rejects_unknown_target(self):
         with pytest.raises(ValidationError):
             validate_supervisor_route("research_agent")
@@ -911,7 +897,7 @@ class TestAgentTaskStateInvariants:
     def test_supervisor_decision_accepts_tool_agent_route_contract(self):
         decision = SupervisorDecision(
             child_agents=["tool_agent"],
-            route="tool_planner",
+            route="tool_agent",
             intent="rag_question",
             reason="valid tool agent route",
             confidence=0.9,
@@ -947,18 +933,18 @@ class TestAgentTaskStateInvariants:
         )
         # The graph should preserve pre-existing artifacts and add more.
         with patch(
-            "app.agent_runtime.tool_manager.call_tool",
+            "deerflow.tool_manager.call_tool",
             return_value=_fake_research_result(ok=True, citations=True),
         ), patch(
-            "app.agent_runtime.runtime.record_memory_event",
+            "deerflow.runtime.record_memory_event",
         ), patch(
-            "app.agent_runtime.runtime.consolidate_task_memory", return_value=[],
+            "deerflow.runtime.consolidate_task_memory", return_value=[],
         ), patch(
-            "app.agent_runtime.runtime.summarize_task_session", return_value=None,
+            "deerflow.runtime.summarize_task_session", return_value=None,
         ), patch(
-            "app.agent_runtime.runtime.append_recent_event",
+            "deerflow.runtime.append_recent_event",
         ), patch(
-            "app.agent_runtime.runtime.publish_task_event",
+            "deerflow.runtime.publish_task_event",
         ):
             graph = build_agent_graph(store, checkpointer=MemorySaver())
             config = {"configurable": {"thread_id": state["task_id"]}}
@@ -969,4 +955,4 @@ class TestAgentTaskStateInvariants:
             final = dict(graph.get_state(config).values)
             artifacts = final.get("artifacts", [])
             # Should contain the pre-existing artifact plus new ones.
-            assert len(artifacts) >= 2, f"Expected ≥2 artifacts, got {len(artifacts)}"
+            assert len(artifacts) >= 2, f"Expected 鈮? artifacts, got {len(artifacts)}"

@@ -8,7 +8,9 @@ export type KnowledgeBase = {
   id: number;
   name: string;
   description?: string | null;
+  visibility: "private" | "shared";
   role?: string | null;
+  can_upload: boolean;
   member_count: number;
   created_at: string;
   updated_at: string;
@@ -57,6 +59,7 @@ export type AnswerResponse = {
   citations: Citation[];
   retrieved_count: number;
   degraded: boolean;
+  warnings: ApiErrorDetail[];
   context_compacted: boolean;
   timings_ms: Record<string, number>;
 };
@@ -79,6 +82,8 @@ export type AgentTask = {
   status: "pending" | "running" | "waiting_user" | "completed" | "failed" | "cancelled";
   user_input: string;
   task_type: string;
+  scenario_key?: string | null;
+  scenario?: Record<string, unknown>;
   kb_id?: number | null;
   document_id?: number | null;
   conversation_id?: number | null;
@@ -160,10 +165,37 @@ export type LearningDashboard = {
   top_weaknesses: LearningWeakness[];
 };
 
+export type ApiErrorDetail = {
+  code: string;
+  message: string;
+  request_id?: string;
+  retryable?: boolean;
+  details?: Record<string, unknown>;
+};
+
+export class ApiError extends Error {
+  code: string;
+  status: number;
+  requestId?: string;
+  retryable: boolean;
+  details: Record<string, unknown>;
+
+  constructor(status: number, detail: ApiErrorDetail) {
+    super(detail.message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = detail.code;
+    this.requestId = detail.request_id;
+    this.retryable = Boolean(detail.retryable);
+    this.details = detail.details ?? {};
+  }
+}
+
 const API_BASE = import.meta.env.VITE_API_BASE?.replace(/\/$/, "") ?? "";
 const ACCESS_KEY = "interview_improvement_rag_access";
 const REFRESH_KEY = "interview_improvement_rag_refresh";
 const USER_KEY = "interview_improvement_rag_user";
+export const AUTH_INVALID_EVENT = "interview-improvement-rag:auth-invalid";
 
 export const tokenStore = {
   access: () => localStorage.getItem(ACCESS_KEY) ?? "",
@@ -185,16 +217,68 @@ function authHeaders() {
   return { Authorization: `Bearer ${tokenStore.access()}` };
 }
 
-async function parseError(response: Response) {
+function normalizeErrorDetail(response: Response, data: unknown): ApiErrorDetail {
+  if (data && typeof data === "object") {
+    const root = data as Record<string, unknown>;
+    const detail = root.detail;
+    if (detail && typeof detail === "object") {
+      const payload = detail as Record<string, unknown>;
+      return {
+        code: String(payload.code ?? `HTTP_${response.status}`),
+        message: String(payload.message ?? payload.detail ?? `请求失败 (HTTP ${response.status})`),
+        request_id: typeof payload.request_id === "string" ? payload.request_id : response.headers.get("X-Request-ID") ?? undefined,
+        retryable: Boolean(payload.retryable),
+        details: payload.details && typeof payload.details === "object" ? payload.details as Record<string, unknown> : {}
+      };
+    }
+    if (typeof detail === "string") {
+      return {
+        code: `HTTP_${response.status}`,
+        message: detail,
+        request_id: response.headers.get("X-Request-ID") ?? undefined,
+        retryable: response.status >= 500,
+        details: {}
+      };
+    }
+  }
+  return {
+    code: `HTTP_${response.status}`,
+    message: `请求失败 (HTTP ${response.status})`,
+    request_id: response.headers.get("X-Request-ID") ?? undefined,
+    retryable: response.status >= 500,
+    details: {}
+  };
+}
+
+async function parseError(response: Response): Promise<ApiErrorDetail> {
   const raw = await response.text().catch(() => "");
   try {
-    const data = raw ? JSON.parse(raw) : {};
-    if (typeof data.detail === "string") return data.detail;
-    if (data.detail) return JSON.stringify(data.detail);
+    return normalizeErrorDetail(response, raw ? JSON.parse(raw) : {});
   } catch {
-    if (raw) return raw;
+    if (raw) {
+      return {
+        code: `HTTP_${response.status}`,
+        message: raw,
+        request_id: response.headers.get("X-Request-ID") ?? undefined,
+        retryable: response.status >= 500,
+        details: {}
+      };
+    }
   }
-  return `请求失败 (HTTP ${response.status})`;
+  return normalizeErrorDetail(response, {});
+}
+
+function handleAuthError(response: Response, detail: ApiErrorDetail) {
+  if (response.status !== 401) return;
+  if (!["AUTH_TOKEN_INVALID", "AUTH_TOKEN_EXPIRED"].includes(detail.code)) return;
+  tokenStore.clear();
+  window.dispatchEvent(new CustomEvent(AUTH_INVALID_EVENT, { detail: detail.code }));
+}
+
+async function throwApiError(response: Response): Promise<never> {
+  const detail = await parseError(response);
+  handleAuthError(response, detail);
+  throw new ApiError(response.status, detail);
 }
 
 async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -206,7 +290,7 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
       ...(init.headers ?? {})
     }
   });
-  if (!response.ok) throw new Error(await parseError(response));
+  if (!response.ok) await throwApiError(response);
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
@@ -217,7 +301,7 @@ export async function login(username: string, password: string) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password })
   });
-  if (!response.ok) throw new Error(await parseError(response));
+  if (!response.ok) await throwApiError(response);
   return response.json() as Promise<TokenResponse>;
 }
 
@@ -227,7 +311,7 @@ export async function register(username: string, password: string) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password })
   });
-  if (!response.ok) throw new Error(await parseError(response));
+  if (!response.ok) await throwApiError(response);
   return response.json();
 }
 
@@ -235,10 +319,10 @@ export function listKnowledgeBases() {
   return requestJson<KnowledgeBase[]>("/kb");
 }
 
-export function createKnowledgeBase(name: string, description: string) {
+export function createKnowledgeBase(name: string, description: string, visibility: "private" | "shared" = "private") {
   return requestJson<KnowledgeBase>("/kb", {
     method: "POST",
-    body: JSON.stringify({ name, description })
+    body: JSON.stringify({ name, description, visibility })
   });
 }
 
@@ -256,7 +340,7 @@ export async function uploadDocument(file: File, kbId?: number) {
     headers: authHeaders(),
     body: form
   });
-  if (!response.ok) throw new Error(await parseError(response));
+  if (!response.ok) await throwApiError(response);
   return response.json();
 }
 
@@ -300,7 +384,7 @@ export async function answerQuestionStream(
     },
     body: JSON.stringify(payload)
   });
-  if (!response.ok) throw new Error(await parseError(response));
+  if (!response.ok) await throwApiError(response);
   if (!response.body) return answerQuestion(payload);
 
   const reader = response.body.getReader();
@@ -322,7 +406,9 @@ export async function answerQuestionStream(
       return;
     }
     if (packet.event === "error") {
-      throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data));
+      const status = typeof data.status_code === "number" ? data.status_code : 500;
+      const detail = normalizeErrorDetail(new Response(null, { status }), data);
+      throw new ApiError(status, detail);
     }
   };
 
@@ -344,23 +430,35 @@ export async function answerQuestionStream(
   return finalResponse;
 }
 
-export function createAgentTask(payload: {
+export async function createAgentTask(payload: {
   user_input: string;
   task_type?: string;
+  scenario_key?: string;
+  scenario_inputs?: Record<string, unknown>;
   kb_id?: number;
   document_id?: number;
   conversation_id?: number;
   max_steps?: number;
   max_tool_calls?: number;
+  idempotency_key?: string;
 }) {
-  return requestJson<{ session_id: string; task_id: string; run_id: string; status: string }>("/agent/tasks", {
-    method: "POST",
-    body: JSON.stringify({
-      task_type: "interview_improvement",
-      ...payload,
-      idempotency_key: `interview-${Date.now()}`
-    })
+  const { idempotency_key, ...taskPayload } = payload;
+  const body = JSON.stringify({
+    task_type: "interview_improvement",
+    ...taskPayload,
+    // Callers retain this key when retrying a request after an uncertain response.
+    idempotency_key: idempotency_key ?? `interview-${crypto.randomUUID()}`
   });
+  const request = () => requestJson<{ session_id: string; task_id: string; run_id: string; status: string }>("/agent/tasks", {
+    method: "POST",
+    body
+  });
+  try {
+    return await request();
+  } catch (error) {
+    if (!(error instanceof TypeError) && !(error instanceof ApiError && error.retryable)) throw error;
+    return request();
+  }
 }
 
 export function listAgentTasks() {
@@ -397,7 +495,7 @@ export async function streamAgentEvents(
     headers: authHeaders(),
     signal
   });
-  if (!response.ok) throw new Error(await parseError(response));
+  if (!response.ok) await throwApiError(response);
   if (!response.body) return;
 
   const reader = response.body.getReader();
